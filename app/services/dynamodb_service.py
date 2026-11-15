@@ -25,7 +25,7 @@ from boto3.dynamodb.conditions import Attr
 
 from app.core.exceptions import JobAlreadyExistsError, JobNotFoundError, StorageError
 from app.core.logging_config import get_logger
-from app.models.job import DynamoDBJobItem, JobStatus
+from app.models.job import AcquireResult, DynamoDBJobItem, JobStatus
 from app.services.aws_client import get_boto3_resource
 
 logger: logging.Logger = get_logger(__name__)
@@ -169,72 +169,283 @@ class DynamoDBService:
         return DynamoDBJobItem.from_dynamodb_item(item)
 
     # ------------------------------------------------------------------
-    # Update operations & Atomic Claiming
+    # Processing Lease & Atomic Acquisition Operations
     # ------------------------------------------------------------------
 
-    def claim_job(self, job_id: str) -> bool:
-        """Atomically claim a job for processing (transition PENDING -> PROCESSING).
+    def acquire_job_lease(
+        self,
+        job_id: str,
+        worker_id: str,
+        lease_duration_seconds: int = 60,
+        max_attempts: int = 3,
+    ) -> tuple[AcquireResult, Optional[DynamoDBJobItem]]:
+        """Atomically acquire or re-acquire a processing lease for a job.
 
-        Guarantees worker idempotency and prevents concurrent workers from
-        processing the same job. Uses a conditional update requiring
-        status == 'PENDING'.
+        Acquisition succeeds if:
+        1. status == 'PENDING'
+        OR
+        2. status == 'PROCESSING' and lease_expires_at < current_timestamp (previous worker crashed/timed out)
+        AND
+        3. attempt_count < max_attempts (retry threshold has not been exceeded)
 
-        Parameters
-        ----------
-        job_id:
-            Unique identifier of the job to claim.
+        On success:
+        - status becomes PROCESSING
+        - worker_id is assigned
+        - lease_expires_at is set to now + lease_duration_seconds
+        - attempt_count is incremented
+        - processing_version (fencing token) is incremented
 
         Returns
         -------
-        bool
-            True if the job was successfully claimed.
-            False if the job was already claimed (PROCESSING) or finished (COMPLETED/FAILED).
-
-        Raises
-        ------
-        JobNotFoundError
-            If the job does not exist at all in DynamoDB.
-        StorageError
-            On any other DynamoDB / network failure.
+        tuple[AcquireResult, Optional[DynamoDBJobItem]]
+            The acquisition result and the updated job item (if acquired or found).
         """
+        now_ts = int(datetime.now(tz=timezone.utc).timestamp())
+        new_lease_expires = now_ts + lease_duration_seconds
+
         logger.info(
-            "Attempting to atomically claim job",
-            extra={"job_id": job_id, "table": self.table_name},
+            "Attempting to acquire job lease",
+            extra={"job_id": job_id, "worker_id": worker_id, "table": self.table_name},
         )
+
+        condition = (
+            Attr("job_id").exists()
+            & (
+                Attr("status").eq(JobStatus.PENDING.value)
+                | (
+                    Attr("status").eq(JobStatus.PROCESSING.value)
+                    & Attr("lease_expires_at").lt(now_ts)
+                )
+            )
+            & (
+                Attr("attempt_count").not_exists()
+                | Attr("attempt_count").lt(max_attempts)
+            )
+        )
+
+        update_expr = (
+            "SET #st = :processing, "
+            "worker_id = :worker_id, "
+            "lease_expires_at = :lease_expires, "
+            "attempt_count = if_not_exists(attempt_count, :zero) + :one, "
+            "processing_version = if_not_exists(processing_version, :zero) + :one, "
+            "updated_at = :now_iso"
+        )
+        expr_names = {"#st": "status"}
+        expr_values = {
+            ":processing": JobStatus.PROCESSING.value,
+            ":worker_id": worker_id,
+            ":lease_expires": new_lease_expires,
+            ":zero": 0,
+            ":one": 1,
+            ":now_iso": _now_iso(),
+        }
+
+        try:
+            response = self._table.update_item(
+                Key={"job_id": job_id},
+                UpdateExpression=update_expr,
+                ExpressionAttributeNames=expr_names,
+                ExpressionAttributeValues=expr_values,
+                ConditionExpression=condition,
+                ReturnValues="ALL_NEW",
+            )
+            updated_item = DynamoDBJobItem.from_dynamodb_item(response["Attributes"])
+            logger.info(
+                "Lease acquired successfully",
+                extra={
+                    "job_id": job_id,
+                    "worker_id": worker_id,
+                    "version": updated_item.processing_version,
+                    "attempt": updated_item.attempt_count,
+                    "lease_expires_at": updated_item.lease_expires_at,
+                },
+            )
+            return AcquireResult.ACQUIRED, updated_item
+
+        except _ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code == "ConditionalCheckFailedException":
+                # Inspect existing job state to diagnose why acquisition failed
+                try:
+                    current = self.get_job(job_id)
+                except JobNotFoundError:
+                    return AcquireResult.NOT_FOUND, None
+
+                if current.status == JobStatus.COMPLETED:
+                    logger.info("Job already completed — duplicate safe to acknowledge", extra={"job_id": job_id})
+                    return AcquireResult.ALREADY_COMPLETED, current
+
+                if current.attempt_count >= max_attempts:
+                    logger.warning(
+                        "Job exceeded maximum processing attempts — failing job",
+                        extra={"job_id": job_id, "attempts": current.attempt_count, "max_attempts": max_attempts},
+                    )
+                    try:
+                        self.update_job_status(
+                            job_id=job_id,
+                            status=JobStatus.FAILED,
+                            error_message=f"Exceeded max processing attempts ({max_attempts})",
+                        )
+                    except Exception:
+                        pass
+                    return AcquireResult.MAX_ATTEMPTS_EXCEEDED, current
+
+                if current.status == JobStatus.PROCESSING:
+                    if current.lease_expires_at is not None and current.lease_expires_at >= now_ts:
+                        logger.info(
+                            "Job actively owned by another worker with valid lease",
+                            extra={
+                                "job_id": job_id,
+                                "active_worker_id": current.worker_id,
+                                "lease_expires_at": current.lease_expires_at,
+                            },
+                        )
+                        return AcquireResult.ALREADY_ACTIVE, current
+
+                if current.status == JobStatus.FAILED:
+                    return AcquireResult.MAX_ATTEMPTS_EXCEEDED, current
+
+            logger.error("Failed to acquire job lease in DynamoDB", extra={"job_id": job_id, "error": str(exc)})
+            raise StorageError(f"Failed to acquire lease for job {job_id}", details={"job_id": job_id, "error": str(exc)}) from exc
+
+    def renew_job_lease(
+        self,
+        job_id: str,
+        worker_id: str,
+        processing_version: int,
+        extension_seconds: int = 60,
+    ) -> bool:
+        """Extend the lease timestamp for the active worker.
+
+        Fails if another worker has already acquired a new lease generation (fencing).
+        """
+        now_ts = int(datetime.now(tz=timezone.utc).timestamp())
+        new_lease = now_ts + extension_seconds
+
         try:
             self._table.update_item(
                 Key={"job_id": job_id},
-                UpdateExpression="SET #st = :processing, updated_at = :updated_at",
-                ExpressionAttributeNames={"#st": "status"},
+                UpdateExpression="SET lease_expires_at = :exp, updated_at = :now_iso",
                 ExpressionAttributeValues={
-                    ":processing": JobStatus.PROCESSING.value,
-                    ":updated_at": _now_iso(),
+                    ":exp": new_lease,
+                    ":now_iso": _now_iso(),
                 },
-                ConditionExpression=Attr("job_id").exists() & Attr("status").eq(JobStatus.PENDING.value),
+                ConditionExpression=(
+                    Attr("job_id").exists()
+                    & Attr("status").eq(JobStatus.PROCESSING.value)
+                    & Attr("worker_id").eq(worker_id)
+                    & Attr("processing_version").eq(processing_version)
+                ),
             )
-            logger.info("Job successfully claimed for processing", extra={"job_id": job_id})
+            logger.debug(
+                "Lease renewed successfully",
+                extra={"job_id": job_id, "worker_id": worker_id, "version": processing_version, "expires_at": new_lease},
+            )
             return True
         except _ClientError as exc:
             code = exc.response.get("Error", {}).get("Code", "")
             if code == "ConditionalCheckFailedException":
-                # Verify whether the job exists or is already claimed / completed
-                try:
-                    current = self.get_job(job_id)
-                    logger.warning(
-                        "Job claim skipped — already in progress or completed",
-                        extra={"job_id": job_id, "current_status": current.status.value},
-                    )
-                    return False
-                except JobNotFoundError:
-                    raise
-            logger.error(
-                "Failed to claim job in DynamoDB",
-                extra={"job_id": job_id, "error": str(exc)},
+                logger.warning(
+                    "Lease renewal rejected — worker has been fenced out by newer generation",
+                    extra={"job_id": job_id, "worker_id": worker_id, "version": processing_version},
+                )
+                return False
+            logger.error("Error renewing lease", extra={"job_id": job_id, "error": str(exc)})
+            raise StorageError(f"Failed to renew lease for job {job_id}", details={"job_id": job_id, "error": str(exc)}) from exc
+
+    def complete_job_with_lease(
+        self,
+        job_id: str,
+        worker_id: str,
+        processing_version: int,
+        s3_output_key: str,
+        result_url: Optional[str] = None,
+    ) -> bool:
+        """Mark job COMPLETED guarded by worker lease ownership and version fencing token."""
+        set_parts = [
+            "#st = :completed",
+            "s3_output_key = :s3_output_key",
+            "updated_at = :now_iso",
+        ]
+        expr_names = {"#st": "status"}
+        expr_values: dict[str, Any] = {
+            ":completed": JobStatus.COMPLETED.value,
+            ":s3_output_key": s3_output_key,
+            ":now_iso": _now_iso(),
+        }
+        if result_url is not None:
+            set_parts.append("result_url = :result_url")
+            expr_values[":result_url"] = result_url
+
+        update_expr = "SET " + ", ".join(set_parts) + " REMOVE lease_expires_at"
+
+        try:
+            self._table.update_item(
+                Key={"job_id": job_id},
+                UpdateExpression=update_expr,
+                ExpressionAttributeNames=expr_names,
+                ExpressionAttributeValues=expr_values,
+                ConditionExpression=(
+                    Attr("job_id").exists()
+                    & Attr("status").eq(JobStatus.PROCESSING.value)
+                    & Attr("worker_id").eq(worker_id)
+                    & Attr("processing_version").eq(processing_version)
+                ),
             )
-            raise StorageError(
-                f"Failed to claim job {job_id}",
-                details={"job_id": job_id, "error": str(exc)},
-            ) from exc
+            logger.info("Job marked COMPLETED under valid lease", extra={"job_id": job_id, "worker_id": worker_id, "version": processing_version})
+            return True
+        except _ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code == "ConditionalCheckFailedException":
+                logger.warning(
+                    "Completion rejected — worker fenced out by newer generation",
+                    extra={"job_id": job_id, "worker_id": worker_id, "version": processing_version},
+                )
+                return False
+            raise StorageError(f"Failed to complete job {job_id}", details={"job_id": job_id, "error": str(exc)}) from exc
+
+    def fail_job_with_lease(
+        self,
+        job_id: str,
+        worker_id: str,
+        processing_version: int,
+        error_message: str,
+    ) -> bool:
+        """Mark job FAILED guarded by worker lease ownership and version fencing token."""
+        try:
+            self._table.update_item(
+                Key={"job_id": job_id},
+                UpdateExpression="SET #st = :failed, error_message = :err, updated_at = :now_iso REMOVE lease_expires_at",
+                ExpressionAttributeNames={"#st": "status"},
+                ExpressionAttributeValues={
+                    ":failed": JobStatus.FAILED.value,
+                    ":err": error_message,
+                    ":now_iso": _now_iso(),
+                },
+                ConditionExpression=(
+                    Attr("job_id").exists()
+                    & Attr("status").eq(JobStatus.PROCESSING.value)
+                    & Attr("worker_id").eq(worker_id)
+                    & Attr("processing_version").eq(processing_version)
+                ),
+            )
+            logger.info("Job marked FAILED under lease", extra={"job_id": job_id, "worker_id": worker_id})
+            return True
+        except _ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code == "ConditionalCheckFailedException":
+                logger.warning(
+                    "Fail update rejected — worker fenced out",
+                    extra={"job_id": job_id, "worker_id": worker_id, "version": processing_version},
+                )
+                return False
+            raise StorageError(f"Failed to update job {job_id} to FAILED", details={"job_id": job_id, "error": str(exc)}) from exc
+
+    def claim_job(self, job_id: str, worker_id: str = "default-worker") -> bool:
+        """Backward-compatible atomic job claim helper."""
+        res, _ = self.acquire_job_lease(job_id=job_id, worker_id=worker_id)
+        return res == AcquireResult.ACQUIRED
 
     def update_job_status(
         self,

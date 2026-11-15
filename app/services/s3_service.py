@@ -101,7 +101,7 @@ class S3Service:
         )
         return s3_key
 
-    def upload_result(self, job_id: str, result: dict) -> str:
+    def upload_result(self, job_id: str, result: dict, version: Optional[int] = None) -> str:
         """Persist a processing result dict as JSON to S3.
 
         Parameters
@@ -110,6 +110,10 @@ class S3Service:
             Job identifier — used as the key prefix.
         result:
             Arbitrary dict to serialise as JSON.
+        version:
+            Optional processing version token. When supplied, stores output at
+            a versioned key (`result_v{version}.json`) to guarantee idempotency
+            and prevent race condition overwrites between worker attempts.
 
         Returns
         -------
@@ -121,7 +125,10 @@ class S3Service:
         StorageError
             On any S3 / network failure.
         """
-        s3_key = f"{job_id}/output/result.json"
+        if version is not None:
+            s3_key = f"{job_id}/output/result_v{version}.json"
+        else:
+            s3_key = f"{job_id}/output/result.json"
         payload = json.dumps(result, default=str).encode()
         logger.info(
             "Uploading result to S3",
@@ -154,13 +161,16 @@ class S3Service:
     # Download helpers
     # ------------------------------------------------------------------
 
-    def get_result(self, job_id: str) -> Optional[bytes]:
+    def get_result(self, job_id: str, s3_key: Optional[str] = None) -> Optional[bytes]:
         """Download the processing result for a job, if it exists.
 
         Parameters
         ----------
         job_id:
             Job identifier.
+        s3_key:
+            Optional specific S3 key to retrieve (e.g. versioned key). Defaults
+            to `{job_id}/output/result.json`.
 
         Returns
         -------
@@ -173,18 +183,18 @@ class S3Service:
         StorageError
             On unexpected S3 failures (not a simple "not found").
         """
-        s3_key = f"{job_id}/output/result.json"
+        target_key = s3_key or f"{job_id}/output/result.json"
         logger.info(
             "Fetching result from S3",
-            extra={"job_id": job_id, "s3_key": s3_key},
+            extra={"job_id": job_id, "s3_key": target_key},
         )
         try:
-            response = self._client.get_object(Bucket=self.bucket_name, Key=s3_key)
+            response = self._client.get_object(Bucket=self.bucket_name, Key=target_key)
             return response["Body"].read()
         except self._client.exceptions.NoSuchKey:
             logger.info(
                 "Result not found in S3 (job may still be processing)",
-                extra={"job_id": job_id, "s3_key": s3_key},
+                extra={"job_id": job_id, "s3_key": target_key},
             )
             return None
         except Exception as exc:

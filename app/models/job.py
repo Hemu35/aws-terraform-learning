@@ -22,6 +22,16 @@ class JobStatus(str, Enum):
     FAILED = "FAILED"
 
 
+class AcquireResult(str, Enum):
+    """Outcome of attempting to acquire a job processing lease."""
+
+    ACQUIRED = "ACQUIRED"                      # Successfully claimed / re-acquired lease
+    ALREADY_COMPLETED = "ALREADY_COMPLETED"    # Job finished; safe to delete SQS message
+    ALREADY_ACTIVE = "ALREADY_ACTIVE"          # Another worker holds active lease; keep message in SQS
+    MAX_ATTEMPTS_EXCEEDED = "MAX_ATTEMPTS_EXCEEDED"  # Retry limit hit; send to DLQ / fail
+    NOT_FOUND = "NOT_FOUND"                    # Job record does not exist
+
+
 # ---------------------------------------------------------------------------
 # API request / response models
 # ---------------------------------------------------------------------------
@@ -76,6 +86,10 @@ class DynamoDBJobItem(BaseModel):
     result_url: Optional[str] = None
     error_message: Optional[str] = None
     expires_at: Optional[int] = None
+    worker_id: Optional[str] = None
+    lease_expires_at: Optional[int] = None
+    attempt_count: int = 0
+    processing_version: int = 0
 
     # ------------------------------------------------------------------
     # Serialisation helpers
@@ -102,6 +116,14 @@ class DynamoDBJobItem(BaseModel):
             item["s3_output_key"] = self.s3_output_key
         if self.expires_at is not None:
             item["expires_at"] = self.expires_at
+        if self.worker_id is not None:
+            item["worker_id"] = self.worker_id
+        if self.lease_expires_at is not None:
+            item["lease_expires_at"] = self.lease_expires_at
+        if self.attempt_count:
+            item["attempt_count"] = self.attempt_count
+        if self.processing_version:
+            item["processing_version"] = self.processing_version
         return item
 
     @classmethod
@@ -113,6 +135,7 @@ class DynamoDBJobItem(BaseModel):
         and coerce ``status`` back into :class:`JobStatus`.
         """
         expires_val = item.get("expires_at")
+        lease_val = item.get("lease_expires_at")
         return cls(
             job_id=item["job_id"],
             status=JobStatus(item["status"]),
@@ -124,4 +147,8 @@ class DynamoDBJobItem(BaseModel):
             result_url=item.get("result_url"),
             error_message=item.get("error_message"),
             expires_at=int(expires_val) if expires_val is not None else None,
+            worker_id=item.get("worker_id"),
+            lease_expires_at=int(lease_val) if lease_val is not None else None,
+            attempt_count=int(item.get("attempt_count", 0)),
+            processing_version=int(item.get("processing_version", 0)),
         )

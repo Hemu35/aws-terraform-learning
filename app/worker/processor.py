@@ -22,12 +22,13 @@ from __future__ import annotations
 
 import logging
 import threading
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
 from app.core.exceptions import StorageError
 from app.core.logging_config import get_logger
-from app.models.job import JobStatus
+from app.models.job import AcquireResult, JobStatus
 from app.services.dynamodb_service import DynamoDBService
 from app.services.s3_service import S3Service
 from app.services.sqs_service import SQSService
@@ -36,29 +37,46 @@ logger: logging.Logger = get_logger(__name__)
 
 
 class VisibilityHeartbeat:
-    """Background heartbeat that periodically extends SQS message visibility timeout.
+    """Background heartbeat that periodically extends SQS message visibility timeout
+    and renews the DynamoDB processing lease.
 
-    Runs in a background thread to prevent duplicate delivery when document
-    processing takes longer than the default SQS visibility timeout.
+    Runs in a background thread to prevent duplicate delivery and lease expiration
+    when document processing takes longer than default timeouts.
+    If lease renewal is rejected (fenced out by a newer worker generation),
+    the thread signals `is_fenced_out` so the processor can abort safely.
     """
 
     def __init__(
         self,
         sqs: SQSService,
         receipt_handle: str,
-        interval_seconds: int = 60,
-        extension_seconds: int = 120,
+        interval_seconds: int = 20,
+        extension_seconds: int = 60,
+        dynamo: Optional[DynamoDBService] = None,
+        job_id: Optional[str] = None,
+        worker_id: Optional[str] = None,
+        processing_version: Optional[int] = None,
     ) -> None:
         self._sqs = sqs
         self._receipt_handle = receipt_handle
         self._interval = interval_seconds
         self._extension = extension_seconds
+        self._dynamo = dynamo
+        self._job_id = job_id
+        self._worker_id = worker_id
+        self._processing_version = processing_version
         self._stop_event = threading.Event()
+        self._fenced_out_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
+    @property
+    def is_fenced_out(self) -> bool:
+        """Returns True if this worker was fenced out during lease renewal."""
+        return self._fenced_out_event.is_set()
+
     def __enter__(self) -> "VisibilityHeartbeat":
-        if self._receipt_handle:
-            self._thread = threading.Thread(target=self._run, daemon=True, name="sqs-heartbeat")
+        if self._receipt_handle or (self._dynamo and self._job_id):
+            self._thread = threading.Thread(target=self._run, daemon=True, name="worker-heartbeat")
             self._thread.start()
         return self
 
@@ -69,27 +87,56 @@ class VisibilityHeartbeat:
 
     def _run(self) -> None:
         while not self._stop_event.wait(self._interval):
-            try:
-                self._sqs.change_message_visibility(
-                    self._receipt_handle,
-                    self._extension,
-                )
-                logger.debug(
-                    "Visibility heartbeat extended message visibility",
-                    extra={"extension_seconds": self._extension},
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Heartbeat failed to extend SQS message visibility",
-                    extra={"error": str(exc)},
-                )
+            # 1. Renew DynamoDB lease if configured
+            if self._dynamo and self._job_id and self._worker_id and self._processing_version:
+                try:
+                    renewed = self._dynamo.renew_job_lease(
+                        job_id=self._job_id,
+                        worker_id=self._worker_id,
+                        processing_version=self._processing_version,
+                        extension_seconds=self._extension,
+                    )
+                    if not renewed:
+                        logger.warning(
+                            "DynamoDB lease renewal rejected — worker fenced out by newer generation",
+                            extra={
+                                "job_id": self._job_id,
+                                "worker_id": self._worker_id,
+                                "version": self._processing_version,
+                            },
+                        )
+                        self._fenced_out_event.set()
+                        return
+                except Exception as exc:
+                    logger.warning(
+                        "Heartbeat failed to renew DynamoDB lease",
+                        extra={"job_id": self._job_id, "error": str(exc)},
+                    )
+
+            # 2. Extend SQS visibility timeout
+            if self._receipt_handle:
+                try:
+                    self._sqs.change_message_visibility(
+                        self._receipt_handle,
+                        self._extension,
+                    )
+                    logger.debug(
+                        "Visibility heartbeat extended message visibility",
+                        extra={"extension_seconds": self._extension},
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Heartbeat failed to extend SQS message visibility",
+                        extra={"error": str(exc)},
+                    )
 
 
 class JobProcessor:
-    """Consumes SQS messages and processes documents end-to-end."""
+    """Consumes SQS messages and processes documents end-to-end with distributed leases."""
 
-    def __init__(self, settings: Any) -> None:
+    def __init__(self, settings: Any, worker_id: Optional[str] = None) -> None:
         self._settings = settings
+        self.worker_id = worker_id or f"worker-{uuid.uuid4().hex[:8]}"
         self._s3 = S3Service(settings)
         self._sqs = SQSService(settings)
         self._dynamo = DynamoDBService(settings)
@@ -148,75 +195,153 @@ class JobProcessor:
         }
 
     def process_job(self, job_id: str, receipt_handle: str = "") -> bool:
-        """Process a single job end-to-end with atomic claiming and visibility heartbeat.
+        """Process a single job end-to-end with atomic lease acquisition, version fencing, and heartbeat.
 
         Returns
         -------
         bool
-            True if the job was successfully claimed and processed.
-            False if the job could not be claimed (e.g. already processed or in-progress).
+            True if the SQS message should be deleted (job completed, duplicate, or terminal failure).
+            False if the SQS message should NOT be deleted (job actively owned by another healthy worker,
+            or worker was fenced out).
         """
-        logger.info("Starting processing attempt for job", extra={"job_id": job_id})
+        logger.info(
+            "Starting processing attempt for job",
+            extra={"job_id": job_id, "worker_id": self.worker_id},
+        )
 
-        # 1. Atomic claiming guard: only transition if currently PENDING.
-        # If another worker already claimed or finished it, skip processing.
-        claimed = self._dynamo.claim_job(job_id)
-        if not claimed:
+        lease_duration = getattr(self._settings, "lease_duration_seconds", 60)
+        max_attempts = getattr(self._settings, "max_job_attempts", 3)
+        renew_interval = getattr(self._settings, "lease_renew_interval_seconds", 20)
+
+        # 1. Acquire distributed lease with fencing token (processing_version)
+        acquire_result, job_item = self._dynamo.acquire_job_lease(
+            job_id=job_id,
+            worker_id=self.worker_id,
+            lease_duration_seconds=lease_duration,
+            max_attempts=max_attempts,
+        )
+
+        if acquire_result == AcquireResult.ALREADY_COMPLETED:
             logger.info(
-                "Job already claimed or finished by another worker — skipping",
+                "Job already completed — acknowledging duplicate SQS message",
+                extra={"job_id": job_id},
+            )
+            return True
+
+        if acquire_result == AcquireResult.ALREADY_ACTIVE:
+            logger.info(
+                "Job actively owned by another worker with valid lease — retaining message in SQS for future recovery",
                 extra={"job_id": job_id},
             )
             return False
 
-        # Run processing under a visibility heartbeat to prevent premature redelivery
-        with VisibilityHeartbeat(self._sqs, receipt_handle):
+        if acquire_result == AcquireResult.MAX_ATTEMPTS_EXCEEDED:
+            logger.warning(
+                "Job exceeded max processing attempts — acknowledging message to avoid poison-pill queue block",
+                extra={"job_id": job_id},
+            )
+            return True
+
+        if acquire_result == AcquireResult.NOT_FOUND or job_item is None:
+            logger.error("Job not found in DynamoDB — dropping message", extra={"job_id": job_id})
+            return True
+
+        # At this point, acquire_result == AcquireResult.ACQUIRED
+        version = job_item.processing_version or 1
+        logger.info(
+            "Acquired lease for job",
+            extra={
+                "job_id": job_id,
+                "worker_id": self.worker_id,
+                "version": version,
+                "attempt": job_item.attempt_count,
+            },
+        )
+
+        # Run processing under a dual heartbeat: SQS visibility extension + DynamoDB lease renewal
+        with VisibilityHeartbeat(
+            sqs=self._sqs,
+            receipt_handle=receipt_handle,
+            interval_seconds=renew_interval,
+            extension_seconds=lease_duration,
+            dynamo=self._dynamo,
+            job_id=job_id,
+            worker_id=self.worker_id,
+            processing_version=version,
+        ) as heartbeat:
             try:
-                # 2. Load the job item to find the S3 input key.
-                job_item = self._dynamo.get_job(job_id)
+                # 2. Get input key from job item
                 s3_input_key = job_item.s3_input_key
                 logger.info(
-                    "Retrieved job item",
+                    "Retrieved job input key",
                     extra={"job_id": job_id, "s3_input_key": s3_input_key},
                 )
 
-                # 3. Download the document.
+                # 3. Download the document
                 content = self._download_document(s3_input_key)
 
-                # 4. Simulate processing.
+                # Check fencing before expensive simulation
+                if heartbeat.is_fenced_out:
+                    logger.warning(
+                        "Worker was fenced out during download — aborting without committing",
+                        extra={"job_id": job_id, "worker_id": self.worker_id, "version": version},
+                    )
+                    return False
+
+                # 4. Simulate processing
                 result = self._simulate_processing(job_id, s3_input_key, content)
                 logger.info(
                     "Processing complete",
                     extra={"job_id": job_id, "word_count": result["word_count"]},
                 )
 
-                # 5. Upload result JSON to S3.
-                result_key = self._s3.upload_result(job_id, result)
+                # Check fencing before writing to S3
+                if heartbeat.is_fenced_out:
+                    logger.warning(
+                        "Worker was fenced out during processing — aborting S3 result write",
+                        extra={"job_id": job_id, "worker_id": self.worker_id, "version": version},
+                    )
+                    return False
 
-                # 6. Generate presigned URL for the result.
+                # 5. Upload result JSON to S3 with versioned output key for idempotency
+                result_key = self._s3.upload_result(job_id, result, version=version)
+
+                # 6. Generate presigned URL for the result
                 presigned_url = self._s3.generate_presigned_url(result_key)
 
-                # 7. Mark COMPLETED with persistent S3 output key and optimistic lock.
-                self._dynamo.update_job_status(
+                # 7. Complete job in DynamoDB guarded by lease ownership and fencing token
+                completed = self._dynamo.complete_job_with_lease(
                     job_id=job_id,
-                    status=JobStatus.COMPLETED,
-                    result_url=presigned_url,
+                    worker_id=self.worker_id,
+                    processing_version=version,
                     s3_output_key=result_key,
-                    expected_status=JobStatus.PROCESSING,
+                    result_url=presigned_url,
                 )
-                logger.info("Job completed successfully", extra={"job_id": job_id})
+
+                if not completed:
+                    logger.warning(
+                        "Completion rejected by DynamoDB conditional check — worker was fenced out by a newer worker",
+                        extra={"job_id": job_id, "worker_id": self.worker_id, "version": version},
+                    )
+                    return False
+
+                logger.info(
+                    "Job completed successfully under lease",
+                    extra={"job_id": job_id, "version": version},
+                )
                 return True
 
             except Exception as exc:
                 logger.error(
-                    "Job processing failed — marking FAILED",
+                    "Job processing failed with exception — attempting to fail with lease",
                     extra={"job_id": job_id, "error": str(exc)},
                 )
                 try:
-                    self._dynamo.update_job_status(
+                    self._dynamo.fail_job_with_lease(
                         job_id=job_id,
-                        status=JobStatus.FAILED,
+                        worker_id=self.worker_id,
+                        processing_version=version,
                         error_message=str(exc),
-                        expected_status=JobStatus.PROCESSING,
                     )
                 except Exception as dynamo_exc:
                     logger.error(
@@ -235,12 +360,16 @@ class JobProcessor:
         SQS message lifecycle
         ---------------------
         - ``receive_messages`` returns list of dicts with ``job_id`` and ``receipt_handle``.
-        - Each message is processed; ``delete_message`` is called only on
-          success *or* graceful FAILED transition (to avoid infinite requeueing
-          of unprocessable messages).
+        - Each message is processed via ``process_job``:
+          - Returns ``True``: message was processed, completed, or terminally failed -> delete message.
+          - Returns ``False``: job is actively owned by another healthy worker or worker was fenced out -> DO NOT delete message.
+        - Unhandled exceptions delete the message to avoid poison-pill queue block.
         - ``KeyboardInterrupt`` is caught for graceful Ctrl-C shutdown.
         """
-        logger.info("Worker starting — polling SQS for jobs")
+        logger.info(
+            "Worker starting — polling SQS for jobs",
+            extra={"worker_id": self.worker_id},
+        )
         try:
             while True:
                 messages = self._sqs.receive_messages()
@@ -263,17 +392,23 @@ class JobProcessor:
                             "Processing SQS job",
                             extra={"job_id": job_id, "receipt_handle": receipt_handle[:20]},
                         )
-                        self.process_job(job_id, receipt_handle=receipt_handle)
-                        logger.info("Job processed successfully", extra={"job_id": job_id})
+                        should_delete = self.process_job(job_id, receipt_handle=receipt_handle)
+                        if should_delete and receipt_handle:
+                            self._sqs.delete_message(receipt_handle)
+                            logger.info("Job processed and SQS message acknowledged", extra={"job_id": job_id})
+                        elif not should_delete:
+                            logger.info(
+                                "Retaining SQS message in queue for recovery or active worker",
+                                extra={"job_id": job_id},
+                            )
 
                     except Exception as exc:
-                        # process_job already marked the job FAILED; delete the
+                        # process_job attempted to mark the job FAILED; delete the
                         # message so it doesn't requeue and block the queue.
                         logger.error(
                             "Error processing job — deleting message to avoid poison-pill requeue",
                             extra={"job_id": job_id, "error": str(exc)},
                         )
-                    finally:
                         if receipt_handle:
                             try:
                                 self._sqs.delete_message(receipt_handle)

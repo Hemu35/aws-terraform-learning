@@ -48,6 +48,11 @@ class Settings(BaseSettings):
     # TTL retention in seconds (30 days default)
     job_ttl_seconds: int = 30 * 24 * 60 * 60
 
+    # Worker processing lease configuration
+    lease_duration_seconds: int = 60
+    lease_renew_interval_seconds: int = 20
+    max_job_attempts: int = 3
+
     @property
     def is_local(self) -> bool:
         """True when running against LocalStack, False for real AWS."""

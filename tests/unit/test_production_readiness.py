@@ -29,7 +29,7 @@ from app.api.jobs import get_settings_dep
 from app.core.config import Settings
 from app.core.exceptions import StorageError
 from app.main import app
-from app.models.job import DynamoDBJobItem, JobStatus
+from app.models.job import AcquireResult, DynamoDBJobItem, JobStatus
 from app.services.dynamodb_service import DynamoDBService
 from app.services.s3_service import S3Service
 from app.services.sqs_service import SQSService
@@ -126,11 +126,12 @@ def test_duplicate_sqs_delivery_worker_idempotency():
 
     # Duplicate delivery arrives: processor attempts to process the same job again
     second_run = processor.process_job(job_id)
-    assert second_run is False  # Must be skipped cleanly
+    assert second_run is True  # Safe duplicate acknowledgement (SQS message deleted without reprocessing)
 
-    # Verify status remains COMPLETED and was not corrupted
+    # Verify status remains COMPLETED and s3_output_key is unchanged
     job_after_duplicate = dynamo.get_job(job_id)
     assert job_after_duplicate.status == JobStatus.COMPLETED
+    assert job_after_duplicate.s3_output_key == job_after_first.s3_output_key
 
 
 @mock_aws
@@ -334,3 +335,264 @@ async def test_api_unsupported_media_type_returns_415():
         assert data["error_code"] == "UNSUPPORTED_MEDIA_TYPE"
     finally:
         app.dependency_overrides.clear()
+
+
+# ===========================================================================
+# Phase 3.1: Distributed Leases, Crash Recovery, and Fencing Tests
+# ===========================================================================
+
+
+@mock_aws
+def test_worker_crash_and_expired_lease_reacquisition():
+    """Worker A acquires a lease, crashes. When lease expires, Worker B successfully re-acquires and finishes."""
+    settings = _create_test_settings()
+    _bootstrap_mock_aws(settings)
+
+    dynamo = DynamoDBService(settings)
+    s3 = S3Service(settings)
+
+    job_id = "crash-recovery-job-001"
+    now = datetime.now(tz=timezone.utc)
+    s3_key = s3.upload_document(job_id, "test.txt", b"Crash recovery test", "text/plain")
+
+    dynamo.create_job(
+        DynamoDBJobItem(
+            job_id=job_id,
+            status=JobStatus.PENDING,
+            filename="test.txt",
+            created_at=now,
+            updated_at=now,
+            s3_input_key=s3_key,
+        )
+    )
+
+    # 1. Worker A acquires lease
+    res_a, item_a = dynamo.acquire_job_lease(job_id, worker_id="worker-A", lease_duration_seconds=60)
+    assert res_a == AcquireResult.ACQUIRED
+    assert item_a.worker_id == "worker-A"
+    assert item_a.processing_version == 1
+    assert item_a.attempt_count == 1
+    assert item_a.status == JobStatus.PROCESSING
+
+    # 2. Worker A crashes! We simulate time passing past the lease expiry
+    # Backdate the lease_expires_at timestamp in DynamoDB to 10 seconds in the past
+    past_timestamp = int(datetime.now(tz=timezone.utc).timestamp()) - 10
+    dynamo._table.update_item(
+        Key={"job_id": job_id},
+        UpdateExpression="SET lease_expires_at = :past",
+        ExpressionAttributeValues={":past": past_timestamp},
+    )
+
+    # 3. Worker B arrives via SQS redelivery and attempts to acquire lease
+    res_b, item_b = dynamo.acquire_job_lease(job_id, worker_id="worker-B", lease_duration_seconds=60)
+    assert res_b == AcquireResult.ACQUIRED
+    assert item_b.worker_id == "worker-B"
+    assert item_b.processing_version == 2  # Monotonically incremented fencing token
+    assert item_b.attempt_count == 2
+    assert item_b.status == JobStatus.PROCESSING
+
+    # 4. Worker B completes the job
+    completed = dynamo.complete_job_with_lease(
+        job_id=job_id,
+        worker_id="worker-B",
+        processing_version=2,
+        s3_output_key=f"{job_id}/output/result_v2.json",
+    )
+    assert completed is True
+
+    final_job = dynamo.get_job(job_id)
+    assert final_job.status == JobStatus.COMPLETED
+    assert final_job.worker_id == "worker-B"
+    assert final_job.processing_version == 2
+    assert final_job.s3_output_key == f"{job_id}/output/result_v2.json"
+
+
+@mock_aws
+def test_active_lease_prevents_concurrent_claim_and_preserves_sqs():
+    """An active unexpired lease prevents concurrent claims and returns False to retain the SQS message."""
+    settings = _create_test_settings()
+    _bootstrap_mock_aws(settings)
+
+    dynamo = DynamoDBService(settings)
+    s3 = S3Service(settings)
+
+    job_id = "concurrent-active-lease-job"
+    now = datetime.now(tz=timezone.utc)
+    s3_key = s3.upload_document(job_id, "test.txt", b"Active lease test", "text/plain")
+
+    dynamo.create_job(
+        DynamoDBJobItem(
+            job_id=job_id,
+            status=JobStatus.PENDING,
+            filename="test.txt",
+            created_at=now,
+            updated_at=now,
+            s3_input_key=s3_key,
+        )
+    )
+
+    # Worker A acquires active lease for 300 seconds
+    res_a, _ = dynamo.acquire_job_lease(job_id, worker_id="worker-A", lease_duration_seconds=300)
+    assert res_a == AcquireResult.ACQUIRED
+
+    # Worker B runs JobProcessor.process_job
+    processor_b = JobProcessor(settings, worker_id="worker-B")
+    should_delete = processor_b.process_job(job_id)
+
+    # Must return False so the SQS message is NOT deleted
+    assert should_delete is False
+
+    # Job remains PROCESSING owned by Worker A
+    current = dynamo.get_job(job_id)
+    assert current.status == JobStatus.PROCESSING
+    assert current.worker_id == "worker-A"
+
+
+@mock_aws
+def test_stale_worker_fenced_out_on_complete_and_renew():
+    """A stale worker whose lease expired and was claimed by another worker is fenced out."""
+    settings = _create_test_settings()
+    _bootstrap_mock_aws(settings)
+
+    dynamo = DynamoDBService(settings)
+
+    job_id = "fencing-token-test-job"
+    now = datetime.now(tz=timezone.utc)
+    dynamo.create_job(
+        DynamoDBJobItem(
+            job_id=job_id,
+            status=JobStatus.PENDING,
+            filename="test.txt",
+            created_at=now,
+            updated_at=now,
+            s3_input_key="path/test.txt",
+        )
+    )
+
+    # Worker A acquires generation 1
+    res_a, _ = dynamo.acquire_job_lease(job_id, worker_id="worker-A", lease_duration_seconds=60)
+    assert res_a == AcquireResult.ACQUIRED
+
+    # Simulate Worker A stall & lease expiry
+    past_timestamp = int(datetime.now(tz=timezone.utc).timestamp()) - 20
+    dynamo._table.update_item(
+        Key={"job_id": job_id},
+        UpdateExpression="SET lease_expires_at = :past",
+        ExpressionAttributeValues={":past": past_timestamp},
+    )
+
+    # Worker B claims generation 2
+    res_b, _ = dynamo.acquire_job_lease(job_id, worker_id="worker-B", lease_duration_seconds=60)
+    assert res_b == AcquireResult.ACQUIRED
+
+    # Worker A wakes up and tries to renew its expired lease (version 1) -> Fenced out!
+    renew_result = dynamo.renew_job_lease(job_id, worker_id="worker-A", processing_version=1)
+    assert renew_result is False
+
+    # Worker A tries to complete the job with version 1 -> Fenced out!
+    complete_result = dynamo.complete_job_with_lease(
+        job_id,
+        worker_id="worker-A",
+        processing_version=1,
+        s3_output_key=f"{job_id}/output/result_v1.json",
+    )
+    assert complete_result is False
+
+    # Worker B completes the job with version 2 -> Succeeds!
+    complete_b = dynamo.complete_job_with_lease(
+        job_id,
+        worker_id="worker-B",
+        processing_version=2,
+        s3_output_key=f"{job_id}/output/result_v2.json",
+    )
+    assert complete_b is True
+
+    # Final state reflects Worker B's work
+    job = dynamo.get_job(job_id)
+    assert job.status == JobStatus.COMPLETED
+    assert job.worker_id == "worker-B"
+    assert job.processing_version == 2
+    assert job.s3_output_key == f"{job_id}/output/result_v2.json"
+
+
+@mock_aws
+def test_max_attempts_exceeded_fails_job_and_acknowledges():
+    """A poison job exceeding max attempts is transitioned to FAILED and acknowledged."""
+    settings = _create_test_settings()
+    settings.max_job_attempts = 3
+    _bootstrap_mock_aws(settings)
+
+    dynamo = DynamoDBService(settings)
+
+    job_id = "poison-pill-job-max-attempts"
+    now = datetime.now(tz=timezone.utc)
+    dynamo.create_job(
+        DynamoDBJobItem(
+            job_id=job_id,
+            status=JobStatus.PROCESSING,
+            filename="test.txt",
+            created_at=now,
+            updated_at=now,
+            s3_input_key="path/test.txt",
+            attempt_count=3,  # Already at max attempts
+            lease_expires_at=int(now.timestamp()) - 10,  # Expired
+            processing_version=3,
+        )
+    )
+
+    processor = JobProcessor(settings, worker_id="worker-rescue")
+    should_delete = processor.process_job(job_id)
+
+    # Must return True so SQS message is deleted and doesn't loop infinitely
+    assert should_delete is True
+
+    # Job is marked FAILED in DynamoDB
+    job = dynamo.get_job(job_id)
+    assert job.status == JobStatus.FAILED
+    assert "Exceeded max processing attempts" in (job.error_message or "")
+
+
+@mock_aws
+def test_visibility_heartbeat_renews_dynamodb_lease():
+    """VisibilityHeartbeat periodically renews the DynamoDB lease in the background."""
+    settings = _create_test_settings()
+    _bootstrap_mock_aws(settings)
+
+    dynamo = DynamoDBService(settings)
+    job_id = "heartbeat-renewal-job"
+    now = datetime.now(tz=timezone.utc)
+    dynamo.create_job(
+        DynamoDBJobItem(
+            job_id=job_id,
+            status=JobStatus.PENDING,
+            filename="test.txt",
+            created_at=now,
+            updated_at=now,
+            s3_input_key="path/test.txt",
+        )
+    )
+
+    # Acquire lease for 10 seconds
+    dynamo.acquire_job_lease(job_id, worker_id="worker-hb", lease_duration_seconds=10)
+    initial_job = dynamo.get_job(job_id)
+    initial_exp = initial_job.lease_expires_at
+
+    # Start heartbeat with very small interval and larger extension
+    with VisibilityHeartbeat(
+        sqs=MagicMock(),
+        receipt_handle="dummy-handle",
+        interval_seconds=0.05,
+        extension_seconds=100,
+        dynamo=dynamo,
+        job_id=job_id,
+        worker_id="worker-hb",
+        processing_version=1,
+    ) as hb:
+        time.sleep(0.12)
+        assert not hb.is_fenced_out
+
+    # Verify that the lease timestamp was renewed to a higher value
+    renewed_job = dynamo.get_job(job_id)
+    assert renewed_job.lease_expires_at is not None
+    assert initial_exp is not None
+    assert renewed_job.lease_expires_at > initial_exp
