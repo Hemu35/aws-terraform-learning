@@ -57,8 +57,28 @@ class JobAlreadyExistsError(AppError):
 
 
 class StorageError(AppError):
-    """Raised when an S3 operation fails."""
+    """Raised when an S3 or DynamoDB storage operation fails."""
 
 
 class QueueError(AppError):
     """Raised when an SQS operation fails."""
+
+
+class PayloadTooLargeError(AppError):
+    """Raised when an uploaded document exceeds the maximum permitted size."""
+
+    def __init__(self, size: int, max_size: int, details: Optional[dict[str, Any]] = None) -> None:
+        super().__init__(
+            message=f"Uploaded file size ({size} bytes) exceeds maximum limit of {max_size} bytes.",
+            details=details or {"size": size, "max_size": max_size},
+        )
+
+
+class InvalidFileTypeError(AppError):
+    """Raised when an uploaded document has an unsupported MIME or file type."""
+
+    def __init__(self, content_type: str, allowed_types: list[str], details: Optional[dict[str, Any]] = None) -> None:
+        super().__init__(
+            message=f"File content type '{content_type}' is not supported. Allowed: {allowed_types}",
+            details=details or {"content_type": content_type, "allowed_types": allowed_types},
+        )

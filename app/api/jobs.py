@@ -23,17 +23,23 @@ Design decisions:
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, Form, UploadFile
 
 from app.core.config import Settings, get_settings
+from app.core.exceptions import InvalidFileTypeError, PayloadTooLargeError
+from app.core.logging_config import get_logger
 from app.models.job import DynamoDBJobItem, JobResponse, JobStatus, JobSubmitResponse
 from app.services.dynamodb_service import DynamoDBService
 from app.services.s3_service import S3Service
 from app.services.sqs_service import SQSService
+
+logger: logging.Logger = get_logger(__name__)
 
 router = APIRouter(tags=["jobs"])
 
@@ -102,6 +108,7 @@ async def submit_job(
         str | None,
         Form(description="Override the uploaded filename"),
     ] = None,
+    settings: Settings = Depends(get_settings_dep),
     dynamodb_service: DynamoDBService = Depends(get_dynamodb_service),
     s3_service: S3Service = Depends(get_s3_service),
     sqs_service: SQSService = Depends(get_sqs_service),
@@ -111,23 +118,55 @@ async def submit_job(
     Why 202?
     --------
     Processing is asynchronous — the worker picks up the job from SQS and may
-    take seconds to minutes to complete.  202 Accepted signals to the caller
+    take seconds to minutes to complete. 202 Accepted signals to the caller
     that the request has been received and will be acted upon, but the result
-    is not yet available.  Clients should poll GET /jobs/{job_id} for status.
+    is not yet available. Clients should poll GET /jobs/{job_id} for status.
 
-    Flow:
-    1. Create a PENDING job record in DynamoDB (idempotent guard against double-submit).
-    2. Upload the raw document to S3.
-    3. Update s3_input_key in DynamoDB so the worker knows where to find the file.
-    4. Send a message to SQS so the worker picks it up.
-    5. Return 202 with the job_id for polling.
+    Production safeguards:
+    - Content-type validation against allowed whitelist
+    - Chunked streaming upload size enforcement to prevent memory exhaustion (DoS/OOM)
+    - Synchronous Boto3 SDK calls offloaded to worker threadpool via asyncio.to_thread
+    - TTL expires_at metadata set on DynamoDB record
     """
-    job_id = str(uuid.uuid4())
     effective_filename = filename or file.filename or "document"
     content_type = file.content_type or "application/octet-stream"
-    now = datetime.now(tz=timezone.utc)
 
-    # 1. Create the job record in DynamoDB with PENDING status.
+    # 1. Content-Type validation
+    allowed_types = settings.allowed_content_types
+    is_allowed = (
+        content_type in allowed_types
+        or any(effective_filename.lower().endswith(ext) for ext in [".pdf", ".txt", ".csv", ".json", ".docx"])
+    )
+    if not is_allowed:
+        logger.warning(
+            "Rejected upload with unsupported content type",
+            extra={"content_type": content_type, "doc_filename": effective_filename},
+        )
+        raise InvalidFileTypeError(content_type, allowed_types)
+
+    # 2. Upload size validation (stream in chunks to protect against memory explosion)
+    max_bytes = settings.max_upload_size_bytes
+    chunks: list[bytes] = []
+    total_bytes = 0
+    chunk_size = 1024 * 1024  # 1 MB
+
+    while chunk := await file.read(chunk_size):
+        total_bytes += len(chunk)
+        if total_bytes > max_bytes:
+            logger.warning(
+                "Rejected oversized document upload",
+                extra={"bytes_read": total_bytes, "max_bytes": max_bytes, "doc_filename": effective_filename},
+            )
+            raise PayloadTooLargeError(total_bytes, max_bytes)
+        chunks.append(chunk)
+
+    content = b"".join(chunks)
+
+    # 3. Job creation with TTL
+    job_id = str(uuid.uuid4())
+    now = datetime.now(tz=timezone.utc)
+    expires_at = int((now + timedelta(seconds=settings.job_ttl_seconds)).timestamp())
+
     job_item = DynamoDBJobItem(
         job_id=job_id,
         status=JobStatus.PENDING,
@@ -135,18 +174,26 @@ async def submit_job(
         created_at=now,
         updated_at=now,
         s3_input_key="",  # will be updated after S3 upload
+        expires_at=expires_at,
     )
-    dynamodb_service.create_job(job_item)
 
-    # 2. Upload the document to S3.
-    content = await file.read()
-    s3_key = s3_service.upload_document(job_id, effective_filename, content, content_type)
+    logger.info("Submitting new document processing job", extra={"job_id": job_id, "size_bytes": total_bytes})
 
-    # 3. Persist the S3 key back to DynamoDB so the worker knows where to fetch.
-    _set_s3_input_key(dynamodb_service, job_id, s3_key)
+    # Execute blocking Boto3 calls in a separate thread so the FastAPI async loop remains non-blocking
+    await asyncio.to_thread(dynamodb_service.create_job, job_item)
 
-    # 4. Enqueue the job for the worker.
-    sqs_service.send_job(job_id)
+    # 4. Upload document to S3
+    s3_key = await asyncio.to_thread(
+        s3_service.upload_document, job_id, effective_filename, content, content_type
+    )
+
+    # 5. Persist the S3 key back to DynamoDB
+    await asyncio.to_thread(_set_s3_input_key, dynamodb_service, job_id, s3_key)
+
+    # 6. Enqueue the job for the worker
+    await asyncio.to_thread(sqs_service.send_job, job_id)
+
+    logger.info("Job successfully queued", extra={"job_id": job_id, "s3_key": s3_key})
 
     return JobSubmitResponse(
         job_id=job_id,
@@ -163,19 +210,16 @@ async def get_job_status(
 ) -> JobResponse:
     """Return the current status of a processing job.
 
-    When the job is COMPLETED and a result_url is recorded, a fresh presigned
-    URL is generated on every request rather than stored permanently.  This keeps
-    the DynamoDB record free of time-limited secrets and ensures the URL the
-    client receives is always valid for the full expiry window.
+    When the job is COMPLETED, a fresh presigned URL is generated dynamically
+    from the stored S3 output key rather than serving static or stale tokens.
     """
-    job_item: DynamoDBJobItem = dynamodb_service.get_job(job_id)
+    logger.info("Polling status for job", extra={"job_id": job_id})
+    job_item: DynamoDBJobItem = await asyncio.to_thread(dynamodb_service.get_job, job_id)
 
     result_url: str | None = None
-    if job_item.status == JobStatus.COMPLETED and job_item.result_url:
-        # result_url stored in DynamoDB is the presigned URL set by the worker;
-        # regenerate a fresh one so it never expires for the caller.
-        result_key = f"{job_id}/output/result.json"
-        result_url = s3_service.generate_presigned_url(result_key)
+    if job_item.status == JobStatus.COMPLETED:
+        result_key = job_item.s3_output_key or f"{job_id}/output/result.json"
+        result_url = await asyncio.to_thread(s3_service.generate_presigned_url, result_key)
         # In local Docker Compose, translate internal container host to localhost for host clients
         if result_url and "http://localstack:4566" in result_url:
             result_url = result_url.replace("http://localstack:4566", "http://localhost:4566")

@@ -58,3 +58,55 @@ resource "aws_sqs_queue" "main" {
     ManagedBy   = "terraform"
   }
 }
+
+# ------------------------------------------------------------
+# Observability: CloudWatch Alarms for Queue Health
+# ------------------------------------------------------------
+
+# Alert immediately if any poison messages arrive in the DLQ
+resource "aws_cloudwatch_metric_alarm" "dlq_messages" {
+  alarm_name          = "${var.project_name}-${var.environment}-sqs-dlq-messages"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "ApproximateNumberOfMessagesVisible"
+  namespace           = "AWS/SQS"
+  period              = 60
+  statistic           = "Sum"
+  threshold           = 1
+  alarm_description   = "Alarm when dead-letter queue receives poisoned or unprocessable messages"
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    QueueName = aws_sqs_queue.dlq.name
+  }
+
+  tags = {
+    Project     = var.project_name
+    Environment = var.environment
+    ManagedBy   = "terraform"
+  }
+}
+
+# Alert if processing falls behind and messages age beyond acceptable threshold
+resource "aws_cloudwatch_metric_alarm" "queue_backlog_age" {
+  alarm_name          = "${var.project_name}-${var.environment}-sqs-queue-age"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "ApproximateAgeOfOldestMessage"
+  namespace           = "AWS/SQS"
+  period              = 300
+  statistic           = "Maximum"
+  threshold           = 300 # 5 minutes
+  alarm_description   = "Alarm when messages wait in queue longer than 5 minutes (worker starvation/backlog)"
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    QueueName = aws_sqs_queue.main.name
+  }
+
+  tags = {
+    Project     = var.project_name
+    Environment = var.environment
+    ManagedBy   = "terraform"
+  }
+}

@@ -35,6 +35,19 @@ class Settings(BaseSettings):
     # Runtime environment
     environment: str = "local"
 
+    # Upload validation
+    max_upload_size_bytes: int = 25 * 1024 * 1024  # 25 MB
+    allowed_content_types: list[str] = [
+        "application/pdf",
+        "text/plain",
+        "text/csv",
+        "application/json",
+        "application/octet-stream",
+    ]
+
+    # TTL retention in seconds (30 days default)
+    job_ttl_seconds: int = 30 * 24 * 60 * 60
+
     @property
     def is_local(self) -> bool:
         """True when running against LocalStack, False for real AWS."""

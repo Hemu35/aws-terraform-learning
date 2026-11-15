@@ -21,8 +21,9 @@ Design decisions:
 from __future__ import annotations
 
 import logging
+import threading
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 
 from app.core.exceptions import StorageError
 from app.core.logging_config import get_logger
@@ -32,6 +33,56 @@ from app.services.s3_service import S3Service
 from app.services.sqs_service import SQSService
 
 logger: logging.Logger = get_logger(__name__)
+
+
+class VisibilityHeartbeat:
+    """Background heartbeat that periodically extends SQS message visibility timeout.
+
+    Runs in a background thread to prevent duplicate delivery when document
+    processing takes longer than the default SQS visibility timeout.
+    """
+
+    def __init__(
+        self,
+        sqs: SQSService,
+        receipt_handle: str,
+        interval_seconds: int = 60,
+        extension_seconds: int = 120,
+    ) -> None:
+        self._sqs = sqs
+        self._receipt_handle = receipt_handle
+        self._interval = interval_seconds
+        self._extension = extension_seconds
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def __enter__(self) -> "VisibilityHeartbeat":
+        if self._receipt_handle:
+            self._thread = threading.Thread(target=self._run, daemon=True, name="sqs-heartbeat")
+            self._thread.start()
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+
+    def _run(self) -> None:
+        while not self._stop_event.wait(self._interval):
+            try:
+                self._sqs.change_message_visibility(
+                    self._receipt_handle,
+                    self._extension,
+                )
+                logger.debug(
+                    "Visibility heartbeat extended message visibility",
+                    extra={"extension_seconds": self._extension},
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Heartbeat failed to extend SQS message visibility",
+                    extra={"error": str(exc)},
+                )
 
 
 class JobProcessor:
@@ -48,12 +99,7 @@ class JobProcessor:
     # ------------------------------------------------------------------
 
     def _download_document(self, s3_key: str) -> bytes:
-        """Download a raw document from S3 by its full key.
-
-        This is the worker counterpart to ``S3Service.upload_document``.
-        Unlike ``get_result`` (which assumes the output prefix), this method
-        accepts any key — typically ``{job_id}/input/{filename}``.
-        """
+        """Download a raw document from S3 by its full key."""
         logger.info("Downloading document from S3", extra={"s3_key": s3_key})
         try:
             response = self._s3._client.get_object(
@@ -101,77 +147,83 @@ class JobProcessor:
             ),
         }
 
-    def process_job(self, job_id: str) -> None:
-        """Process a single job end-to-end.
+    def process_job(self, job_id: str, receipt_handle: str = "") -> bool:
+        """Process a single job end-to-end with atomic claiming and visibility heartbeat.
 
-        Steps
-        -----
-        1. Mark job PROCESSING in DynamoDB.
-        2. Retrieve s3_input_key from DynamoDB.
-        3. Download the raw document from S3.
-        4. Simulate processing (word/char count + metadata).
-        5. Upload result JSON to S3.
-        6. Generate presigned URL for the result.
-        7. Mark job COMPLETED with result_url.
-
-        On any failure the job is marked FAILED and the exception is re-raised
-        so the caller can decide whether to delete the SQS message.
+        Returns
+        -------
+        bool
+            True if the job was successfully claimed and processed.
+            False if the job could not be claimed (e.g. already processed or in-progress).
         """
-        logger.info("Starting processing for job", extra={"job_id": job_id})
+        logger.info("Starting processing attempt for job", extra={"job_id": job_id})
 
-        try:
-            # 1. Flip status → PROCESSING
-            self._dynamo.update_job_status(job_id=job_id, status=JobStatus.PROCESSING)
-
-            # 2. Load the job item to find the S3 input key.
-            job_item = self._dynamo.get_job(job_id)
-            s3_input_key = job_item.s3_input_key
+        # 1. Atomic claiming guard: only transition if currently PENDING.
+        # If another worker already claimed or finished it, skip processing.
+        claimed = self._dynamo.claim_job(job_id)
+        if not claimed:
             logger.info(
-                "Retrieved job item",
-                extra={"job_id": job_id, "s3_input_key": s3_input_key},
+                "Job already claimed or finished by another worker — skipping",
+                extra={"job_id": job_id},
             )
+            return False
 
-            # 3. Download the document.
-            content = self._download_document(s3_input_key)
-
-            # 4. Simulate processing.
-            result = self._simulate_processing(job_id, s3_input_key, content)
-            logger.info(
-                "Processing complete",
-                extra={"job_id": job_id, "word_count": result["word_count"]},
-            )
-
-            # 5. Upload result JSON to S3.
-            result_key = self._s3.upload_result(job_id, result)
-
-            # 6. Generate presigned URL (1 hour TTL).
-            presigned_url = self._s3.generate_presigned_url(result_key)
-
-            # 7. Mark COMPLETED.
-            self._dynamo.update_job_status(
-                job_id=job_id,
-                status=JobStatus.COMPLETED,
-                result_url=presigned_url,
-            )
-            logger.info("Job completed successfully", extra={"job_id": job_id})
-
-        except Exception as exc:
-            logger.error(
-                "Job processing failed — marking FAILED",
-                extra={"job_id": job_id, "error": str(exc)},
-            )
+        # Run processing under a visibility heartbeat to prevent premature redelivery
+        with VisibilityHeartbeat(self._sqs, receipt_handle):
             try:
+                # 2. Load the job item to find the S3 input key.
+                job_item = self._dynamo.get_job(job_id)
+                s3_input_key = job_item.s3_input_key
+                logger.info(
+                    "Retrieved job item",
+                    extra={"job_id": job_id, "s3_input_key": s3_input_key},
+                )
+
+                # 3. Download the document.
+                content = self._download_document(s3_input_key)
+
+                # 4. Simulate processing.
+                result = self._simulate_processing(job_id, s3_input_key, content)
+                logger.info(
+                    "Processing complete",
+                    extra={"job_id": job_id, "word_count": result["word_count"]},
+                )
+
+                # 5. Upload result JSON to S3.
+                result_key = self._s3.upload_result(job_id, result)
+
+                # 6. Generate presigned URL for the result.
+                presigned_url = self._s3.generate_presigned_url(result_key)
+
+                # 7. Mark COMPLETED with persistent S3 output key and optimistic lock.
                 self._dynamo.update_job_status(
                     job_id=job_id,
-                    status=JobStatus.FAILED,
-                    error_message=str(exc),
+                    status=JobStatus.COMPLETED,
+                    result_url=presigned_url,
+                    s3_output_key=result_key,
+                    expected_status=JobStatus.PROCESSING,
                 )
-            except Exception as dynamo_exc:
+                logger.info("Job completed successfully", extra={"job_id": job_id})
+                return True
+
+            except Exception as exc:
                 logger.error(
-                    "Could not update job to FAILED in DynamoDB",
-                    extra={"job_id": job_id, "error": str(dynamo_exc)},
+                    "Job processing failed — marking FAILED",
+                    extra={"job_id": job_id, "error": str(exc)},
                 )
-            raise
+                try:
+                    self._dynamo.update_job_status(
+                        job_id=job_id,
+                        status=JobStatus.FAILED,
+                        error_message=str(exc),
+                        expected_status=JobStatus.PROCESSING,
+                    )
+                except Exception as dynamo_exc:
+                    logger.error(
+                        "Could not update job to FAILED in DynamoDB",
+                        extra={"job_id": job_id, "error": str(dynamo_exc)},
+                    )
+                raise
 
     # ------------------------------------------------------------------
     # Main polling loop
@@ -211,7 +263,7 @@ class JobProcessor:
                             "Processing SQS job",
                             extra={"job_id": job_id, "receipt_handle": receipt_handle[:20]},
                         )
-                        self.process_job(job_id)
+                        self.process_job(job_id, receipt_handle=receipt_handle)
                         logger.info("Job processed successfully", extra={"job_id": job_id})
 
                     except Exception as exc:

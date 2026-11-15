@@ -71,12 +71,10 @@ resource "aws_s3_bucket_lifecycle_configuration" "documents" {
   bucket = aws_s3_bucket.documents.id
 
   rule {
-    id     = "expire-input-documents"
+    id     = "expire-documents-after-30-days"
     status = "Enabled"
 
-    filter {
-      prefix = "input/"
-    }
+    filter {}
 
     expiration {
       days = 30

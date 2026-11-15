@@ -62,8 +62,8 @@ class JobSubmitResponse(BaseModel):
 class DynamoDBJobItem(BaseModel):
     """Full item as stored in DynamoDB.
 
-    Extends :class:`JobResponse` with the S3 key of the original upload so
-    that the worker can retrieve the file without re-deriving the key.
+    Extends :class:`JobResponse` with the S3 keys of upload and output,
+    plus an optional Unix epoch `expires_at` timestamp for DynamoDB TTL.
     """
 
     job_id: str
@@ -72,8 +72,10 @@ class DynamoDBJobItem(BaseModel):
     created_at: datetime
     updated_at: datetime
     s3_input_key: str
+    s3_output_key: Optional[str] = None
     result_url: Optional[str] = None
     error_message: Optional[str] = None
+    expires_at: Optional[int] = None
 
     # ------------------------------------------------------------------
     # Serialisation helpers
@@ -86,7 +88,7 @@ class DynamoDBJobItem(BaseModel):
         them to ISO-8601 strings.  :class:`~.JobStatus` is a ``str`` enum
         so it serialises correctly without special handling.
         """
-        return {
+        item = {
             "job_id": self.job_id,
             "status": self.status.value,
             "filename": self.filename,
@@ -96,6 +98,11 @@ class DynamoDBJobItem(BaseModel):
             "result_url": self.result_url,
             "error_message": self.error_message,
         }
+        if self.s3_output_key is not None:
+            item["s3_output_key"] = self.s3_output_key
+        if self.expires_at is not None:
+            item["expires_at"] = self.expires_at
+        return item
 
     @classmethod
     def from_dynamodb_item(cls, item: dict) -> "DynamoDBJobItem":
@@ -105,6 +112,7 @@ class DynamoDBJobItem(BaseModel):
         ``created_at`` and ``updated_at`` back into :class:`datetime` objects
         and coerce ``status`` back into :class:`JobStatus`.
         """
+        expires_val = item.get("expires_at")
         return cls(
             job_id=item["job_id"],
             status=JobStatus(item["status"]),
@@ -112,6 +120,8 @@ class DynamoDBJobItem(BaseModel):
             created_at=datetime.fromisoformat(item["created_at"]),
             updated_at=datetime.fromisoformat(item["updated_at"]),
             s3_input_key=item["s3_input_key"],
+            s3_output_key=item.get("s3_output_key"),
             result_url=item.get("result_url"),
             error_message=item.get("error_message"),
+            expires_at=int(expires_val) if expires_val is not None else None,
         )

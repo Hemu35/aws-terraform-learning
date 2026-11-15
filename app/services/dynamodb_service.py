@@ -169,21 +169,83 @@ class DynamoDBService:
         return DynamoDBJobItem.from_dynamodb_item(item)
 
     # ------------------------------------------------------------------
-    # Update operations
+    # Update operations & Atomic Claiming
     # ------------------------------------------------------------------
+
+    def claim_job(self, job_id: str) -> bool:
+        """Atomically claim a job for processing (transition PENDING -> PROCESSING).
+
+        Guarantees worker idempotency and prevents concurrent workers from
+        processing the same job. Uses a conditional update requiring
+        status == 'PENDING'.
+
+        Parameters
+        ----------
+        job_id:
+            Unique identifier of the job to claim.
+
+        Returns
+        -------
+        bool
+            True if the job was successfully claimed.
+            False if the job was already claimed (PROCESSING) or finished (COMPLETED/FAILED).
+
+        Raises
+        ------
+        JobNotFoundError
+            If the job does not exist at all in DynamoDB.
+        StorageError
+            On any other DynamoDB / network failure.
+        """
+        logger.info(
+            "Attempting to atomically claim job",
+            extra={"job_id": job_id, "table": self.table_name},
+        )
+        try:
+            self._table.update_item(
+                Key={"job_id": job_id},
+                UpdateExpression="SET #st = :processing, updated_at = :updated_at",
+                ExpressionAttributeNames={"#st": "status"},
+                ExpressionAttributeValues={
+                    ":processing": JobStatus.PROCESSING.value,
+                    ":updated_at": _now_iso(),
+                },
+                ConditionExpression=Attr("job_id").exists() & Attr("status").eq(JobStatus.PENDING.value),
+            )
+            logger.info("Job successfully claimed for processing", extra={"job_id": job_id})
+            return True
+        except _ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code == "ConditionalCheckFailedException":
+                # Verify whether the job exists or is already claimed / completed
+                try:
+                    current = self.get_job(job_id)
+                    logger.warning(
+                        "Job claim skipped — already in progress or completed",
+                        extra={"job_id": job_id, "current_status": current.status.value},
+                    )
+                    return False
+                except JobNotFoundError:
+                    raise
+            logger.error(
+                "Failed to claim job in DynamoDB",
+                extra={"job_id": job_id, "error": str(exc)},
+            )
+            raise StorageError(
+                f"Failed to claim job {job_id}",
+                details={"job_id": job_id, "error": str(exc)},
+            ) from exc
 
     def update_job_status(
         self,
         job_id: str,
         status: JobStatus,
         result_url: Optional[str] = None,
+        s3_output_key: Optional[str] = None,
         error_message: Optional[str] = None,
+        expected_status: Optional[JobStatus] = None,
     ) -> None:
-        """Partially update a job's status (and optional related fields).
-
-        Uses ``UpdateExpression`` so only the listed attributes are written;
-        the rest of the item (e.g. ``filename``, ``s3_input_key``) are left
-        untouched.
+        """Partially update a job's status with optional optimistic concurrency.
 
         Parameters
         ----------
@@ -193,22 +255,29 @@ class DynamoDBService:
             New ``JobStatus`` value.
         result_url:
             Optional presigned / public URL to the processing result.
+        s3_output_key:
+            Optional S3 key where the output artifact is permanently stored.
         error_message:
             Optional human-readable error message (populated on failure).
+        expected_status:
+            Optional guard ensuring the update only succeeds if the job is
+            currently in this state (e.g. PROCESSING when setting COMPLETED).
 
         Raises
         ------
         JobNotFoundError
-            If the job doesn't exist (via ``ConditionExpression``).
+            If the job doesn't exist.
         StorageError
-            On any other DynamoDB / network failure.
+            On conditional check failure or any other DynamoDB / network failure.
         """
         logger.info(
             "Updating job status in DynamoDB",
             extra={
                 "job_id": job_id,
                 "new_status": status.value,
+                "expected_status": expected_status.value if expected_status else None,
                 "has_result_url": result_url is not None,
+                "has_output_key": s3_output_key is not None,
                 "has_error": error_message is not None,
             },
         )
@@ -228,11 +297,19 @@ class DynamoDBService:
             set_parts.append("result_url = :result_url")
             expr_values[":result_url"] = result_url
 
+        if s3_output_key is not None:
+            set_parts.append("s3_output_key = :s3_output_key")
+            expr_values[":s3_output_key"] = s3_output_key
+
         if error_message is not None:
             set_parts.append("error_message = :error_message")
             expr_values[":error_message"] = error_message
 
         update_expression = "SET " + ", ".join(set_parts)
+
+        condition = Attr("job_id").exists()
+        if expected_status is not None:
+            condition = condition & Attr("status").eq(expected_status.value)
 
         try:
             self._table.update_item(
@@ -240,19 +317,24 @@ class DynamoDBService:
                 UpdateExpression=update_expression,
                 ExpressionAttributeNames=expr_names,
                 ExpressionAttributeValues=expr_values,
-                ConditionExpression=Attr("job_id").exists(),
+                ConditionExpression=condition,
             )
         except _ClientError as exc:
             code = exc.response.get("Error", {}).get("Code", "")  # type: ignore[attr-defined]
             if code == "ConditionalCheckFailedException":
                 logger.warning(
-                    "Cannot update status — job not found",
-                    extra={"job_id": job_id},
+                    "Cannot update status — conditional check failed (job missing or unexpected status)",
+                    extra={"job_id": job_id, "expected_status": expected_status.value if expected_status else None},
                 )
-                raise JobNotFoundError(
-                    f"Job {job_id} not found",
-                    details={"job_id": job_id},
-                ) from exc
+                # Check if job exists
+                try:
+                    self.get_job(job_id)
+                    raise StorageError(
+                        f"Conditional check failed updating job {job_id}: status was not {expected_status}",
+                        details={"job_id": job_id, "expected_status": str(expected_status)},
+                    ) from exc
+                except JobNotFoundError:
+                    raise JobNotFoundError(f"Job {job_id} not found", details={"job_id": job_id}) from exc
             logger.error(
                 "Failed to update job status in DynamoDB",
                 extra={"job_id": job_id, "error": str(exc)},

@@ -180,6 +180,41 @@ class SQSService:
 
         return parsed
 
+    def change_message_visibility(self, receipt_handle: str, visibility_timeout: int) -> None:
+        """Extend the visibility timeout for an in-flight message (heartbeat).
+
+        Parameters
+        ----------
+        receipt_handle:
+            The receipt handle returned by ``receive_messages``.
+        visibility_timeout:
+            New visibility timeout in seconds (0 to 43200).
+
+        Raises
+        ------
+        QueueError
+            On any SQS / network failure.
+        """
+        logger.info(
+            "Extending SQS message visibility timeout",
+            extra={"queue_url": self.queue_url, "visibility_timeout": visibility_timeout},
+        )
+        try:
+            self._client.change_message_visibility(
+                QueueUrl=self.queue_url,
+                ReceiptHandle=receipt_handle,
+                VisibilityTimeout=visibility_timeout,
+            )
+        except Exception as exc:
+            logger.error(
+                "Failed to change SQS message visibility",
+                extra={"error": str(exc)},
+            )
+            raise QueueError(
+                "Failed to change SQS message visibility",
+                details={"error": str(exc)},
+            ) from exc
+
     def delete_message(self, receipt_handle: str) -> None:
         """Remove a successfully processed message from the queue.
 

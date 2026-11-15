@@ -22,8 +22,10 @@ from fastapi.responses import JSONResponse
 from app.core.config import get_settings
 from app.core.exceptions import (
     AppError,
+    InvalidFileTypeError,
     JobAlreadyExistsError,
     JobNotFoundError,
+    PayloadTooLargeError,
     QueueError,
     StorageError,
 )
@@ -81,9 +83,25 @@ async def job_already_exists_handler(
     )
 
 
+@app.exception_handler(PayloadTooLargeError)
+async def payload_too_large_handler(request: Request, exc: PayloadTooLargeError) -> JSONResponse:
+    return JSONResponse(
+        status_code=413,
+        content={"detail": exc.message, "error_code": "PAYLOAD_TOO_LARGE"},
+    )
+
+
+@app.exception_handler(InvalidFileTypeError)
+async def invalid_file_type_handler(request: Request, exc: InvalidFileTypeError) -> JSONResponse:
+    return JSONResponse(
+        status_code=415,
+        content={"detail": exc.message, "error_code": "UNSUPPORTED_MEDIA_TYPE"},
+    )
+
+
 @app.exception_handler(StorageError)
 async def storage_error_handler(request: Request, exc: StorageError) -> JSONResponse:
-    logger.error("Storage error", extra={"message": exc.message, "details": exc.details})
+    logger.error("Storage error", extra={"error_message": exc.message, "details": exc.details})
     return JSONResponse(
         status_code=503,
         content={"detail": "Storage service unavailable", "error_code": "STORAGE_ERROR"},
@@ -92,7 +110,7 @@ async def storage_error_handler(request: Request, exc: StorageError) -> JSONResp
 
 @app.exception_handler(QueueError)
 async def queue_error_handler(request: Request, exc: QueueError) -> JSONResponse:
-    logger.error("Queue error", extra={"message": exc.message, "details": exc.details})
+    logger.error("Queue error", extra={"error_message": exc.message, "details": exc.details})
     return JSONResponse(
         status_code=503,
         content={"detail": "Queue service unavailable", "error_code": "QUEUE_ERROR"},
@@ -101,7 +119,7 @@ async def queue_error_handler(request: Request, exc: QueueError) -> JSONResponse
 
 @app.exception_handler(AppError)
 async def app_error_handler(request: Request, exc: AppError) -> JSONResponse:
-    logger.error("Application error", extra={"message": exc.message, "details": exc.details})
+    logger.error("Application error", extra={"error_message": exc.message, "details": exc.details})
     return JSONResponse(
         status_code=500,
         content={"detail": exc.message, "error_code": "APP_ERROR"},

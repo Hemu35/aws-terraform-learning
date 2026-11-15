@@ -183,3 +183,55 @@ resource "aws_ecs_service" "api" {
     ManagedBy   = "terraform"
   }
 }
+
+# ------------------------------------------------------------
+# Observability: CloudWatch Alarms for ECS Utilization
+# ------------------------------------------------------------
+
+resource "aws_cloudwatch_metric_alarm" "ecs_cpu_high" {
+  alarm_name          = "${var.project_name}-${var.environment}-ecs-cpu-high"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/ECS"
+  period              = 60
+  statistic           = "Average"
+  threshold           = 80
+  alarm_description   = "Alarm when ECS task CPU exceeds 80% for 2 consecutive minutes"
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    ClusterName = aws_ecs_cluster.main.name
+    ServiceName = aws_ecs_service.api.name
+  }
+
+  tags = {
+    Project     = var.project_name
+    Environment = var.environment
+    ManagedBy   = "terraform"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "ecs_memory_high" {
+  alarm_name          = "${var.project_name}-${var.environment}-ecs-memory-high"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "MemoryUtilization"
+  namespace           = "AWS/ECS"
+  period              = 60
+  statistic           = "Average"
+  threshold           = 80
+  alarm_description   = "Alarm when ECS task Memory exceeds 80% for 2 consecutive minutes"
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    ClusterName = aws_ecs_cluster.main.name
+    ServiceName = aws_ecs_service.api.name
+  }
+
+  tags = {
+    Project     = var.project_name
+    Environment = var.environment
+    ManagedBy   = "terraform"
+  }
+}
