@@ -18,6 +18,7 @@ import io
 import json
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import boto3
@@ -27,7 +28,7 @@ from moto import mock_aws
 
 from app.api.jobs import get_settings_dep
 from app.core.config import Settings
-from app.core.exceptions import StorageError
+from app.core.exceptions import QueueError, StorageError
 from app.main import app
 from app.models.job import AcquireResult, DynamoDBJobItem, JobStatus
 from app.services.dynamodb_service import DynamoDBService
@@ -973,3 +974,161 @@ async def test_api_upload_s3_failure_marks_job_failed():
                 assert data["error_code"] == "STORAGE_ERROR"
         finally:
             app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_api_sqs_enqueue_failure_marks_job_failed_and_returns_503():
+    """When SQS enqueue fails, DynamoDB job is rolled back to FAILED and API returns 503."""
+    with mock_aws():
+        settings = _create_test_settings()
+        _bootstrap_mock_aws(settings)
+        app.dependency_overrides[get_settings_dep] = lambda: settings
+
+        dynamo = DynamoDBService(settings)
+
+        try:
+            with patch.object(SQSService, "send_job", side_effect=QueueError("SQS SendMessage network timeout")):
+                transport = ASGITransport(app=app)
+                async with AsyncClient(transport=transport, base_url="http://test") as client:
+                    files = {"file": ("report.pdf", io.BytesIO(b"Valid PDF Content"), "application/pdf")}
+                    response = await client.post("/api/v1/jobs", files=files)
+
+                assert response.status_code == 503
+                data = response.json()
+                assert data["error_code"] == "QUEUE_ERROR"
+
+                # Verify DynamoDB has the job marked as FAILED rather than dangling in PENDING
+                # Find the job in DynamoDB
+                table = dynamo._table
+                scan_res = table.scan()
+                items = scan_res.get("Items", [])
+                assert len(items) == 1
+                failed_job = items[0]
+                assert failed_job["status"] == "FAILED"
+                assert "Failed to enqueue job to SQS" in failed_job["error_message"]
+        finally:
+            app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_api_client_idempotency_key_deduplication():
+    """Submissions with the same Idempotency-Key return the existing job without duplicates."""
+    with mock_aws():
+        settings = _create_test_settings()
+        _bootstrap_mock_aws(settings)
+        app.dependency_overrides[get_settings_dep] = lambda: settings
+
+        dynamo = DynamoDBService(settings)
+
+        try:
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                files1 = {"file": ("invoice.pdf", io.BytesIO(b"Invoice Document 1"), "application/pdf")}
+                headers = {"Idempotency-Key": "client-idempotency-key-abc"}
+                resp1 = await client.post("/api/v1/jobs", files=files1, headers=headers)
+                assert resp1.status_code == 202
+                data1 = resp1.json()
+                job_id_1 = data1["job_id"]
+                assert data1["status"] == "PENDING"
+
+                # Second identical submission with same Idempotency-Key
+                files2 = {"file": ("invoice.pdf", io.BytesIO(b"Invoice Document 1"), "application/pdf")}
+                resp2 = await client.post("/api/v1/jobs", files=files2, headers=headers)
+                assert resp2.status_code == 202
+                data2 = resp2.json()
+                job_id_2 = data2["job_id"]
+                assert job_id_1 == job_id_2
+                assert "already submitted" in data2["message"].lower()
+
+                # Verify exactly one job in DynamoDB
+                table = dynamo._table
+                scan_res = table.scan()
+                items = scan_res.get("Items", [])
+                assert len(items) == 1
+                assert items[0]["job_id"] == job_id_1
+        finally:
+            app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_api_x_idempotency_key_header_support():
+    """Alternative header X-Idempotency-Key provides identical deduplication."""
+    with mock_aws():
+        settings = _create_test_settings()
+        _bootstrap_mock_aws(settings)
+        app.dependency_overrides[get_settings_dep] = lambda: settings
+
+        try:
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                headers = {"X-Idempotency-Key": "req-999-trans-xyz"}
+                files1 = {"file": ("doc.txt", io.BytesIO(b"Document bytes"), "text/plain")}
+                resp1 = await client.post("/api/v1/jobs", files=files1, headers=headers)
+                assert resp1.status_code == 202
+                job_id_1 = resp1.json()["job_id"]
+
+                files2 = {"file": ("doc.txt", io.BytesIO(b"Document bytes"), "text/plain")}
+                resp2 = await client.post("/api/v1/jobs", files=files2, headers=headers)
+                assert resp2.status_code == 202
+                job_id_2 = resp2.json()["job_id"]
+
+                assert job_id_1 == job_id_2
+        finally:
+            app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_api_atomic_s3_input_key_in_dynamodb():
+    """DynamoDB job creation atomically includes s3_input_key without empty intermediate state."""
+    with mock_aws():
+        settings = _create_test_settings()
+        _bootstrap_mock_aws(settings)
+        app.dependency_overrides[get_settings_dep] = lambda: settings
+
+        dynamo = DynamoDBService(settings)
+
+        try:
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                files = {"file": ("data.csv", io.BytesIO(b"col1,col2\n1,2"), "text/csv")}
+                resp = await client.post("/api/v1/jobs", files=files)
+                assert resp.status_code == 202
+                job_id = resp.json()["job_id"]
+
+                job = dynamo.get_job(job_id)
+                assert job.s3_input_key != ""
+                assert job.s3_input_key.startswith(f"{job_id}/input/")
+                assert job.s3_input_key.endswith("data.csv")
+        finally:
+            app.dependency_overrides.clear()
+
+
+def test_terraform_private_subnet_and_vpc_endpoints_configuration():
+    """Verify Terraform configuration enforces assign_public_ip = false and declares VPC endpoints."""
+    ecs_main_path = Path("terraform/modules/ecs/main.tf")
+    assert ecs_main_path.exists(), "terraform/modules/ecs/main.tf must exist"
+    content = ecs_main_path.read_text(encoding="utf-8")
+
+    # Both services must set assign_public_ip = false
+    assert "assign_public_ip = false" in content
+    assert "assign_public_ip = true" not in content
+
+    # VPC Gateway Endpoints
+    assert 'resource "aws_vpc_endpoint" "s3"' in content
+    assert 'service_name      = "com.amazonaws.${var.aws_region}.s3"' in content
+    assert 'resource "aws_vpc_endpoint" "dynamodb"' in content
+    assert 'service_name      = "com.amazonaws.${var.aws_region}.dynamodb"' in content
+
+    # VPC Interface Endpoints
+    assert 'resource "aws_vpc_endpoint" "sqs"' in content
+    assert 'resource "aws_vpc_endpoint" "ecr_api"' in content
+    assert 'resource "aws_vpc_endpoint" "ecr_dkr"' in content
+    assert 'resource "aws_vpc_endpoint" "logs"' in content
+
+    # Security Groups
+    assert 'resource "aws_security_group" "vpc_endpoints"' in content
+
+    # HTTPS Listener
+    assert 'resource "aws_lb_listener" "https"' in content
+    assert "ELBSecurityPolicy-TLS13-1-2-2021-06" in content
+

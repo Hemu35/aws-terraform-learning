@@ -59,6 +59,30 @@ variable "public_subnet_ids" {
   default     = []
 }
 
+variable "private_subnet_ids" {
+  description = "List of private subnet IDs for ECS tasks (API and Worker) with zero public IP assignment"
+  type        = list(string)
+  default     = []
+}
+
+variable "private_route_table_ids" {
+  description = "List of private route table IDs to associate with S3 and DynamoDB VPC Gateway Endpoints"
+  type        = list(string)
+  default     = []
+}
+
+variable "enable_vpc_endpoints" {
+  description = "Whether to provision VPC endpoints (S3, DynamoDB, SQS, ECR, CloudWatch Logs) for private subnet isolation"
+  type        = bool
+  default     = true
+}
+
+variable "certificate_arn" {
+  description = "ACM Certificate ARN for ALB HTTPS listener on port 443 (optional). If omitted, ALB listens only on HTTP 80."
+  type        = string
+  default     = ""
+}
+
 variable "sqs_queue_name" {
   description = "Name of the SQS queue for worker autoscaling metrics"
   type        = string

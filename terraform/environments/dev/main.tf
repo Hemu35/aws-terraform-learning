@@ -98,18 +98,23 @@ module "iam" {
 module "ecs" {
   source = "../../modules/ecs"
 
-  cluster_name         = "${var.project_name}-${var.environment}-cluster"
-  project_name         = var.project_name
-  environment          = var.environment
-  aws_region           = var.aws_region
-  api_image            = var.api_image
-  worker_image         = var.worker_image
-  api_task_role_arn    = module.iam.api_task_role_arn
-  worker_task_role_arn = module.iam.worker_task_role_arn
-  execution_role_arn   = module.iam.execution_role_arn
-  vpc_id               = var.vpc_id
-  subnet_ids           = var.subnet_ids
-  sqs_queue_name       = module.sqs.queue_name
+  cluster_name            = "${var.project_name}-${var.environment}-cluster"
+  project_name            = var.project_name
+  environment             = var.environment
+  aws_region              = var.aws_region
+  api_image               = var.api_image
+  worker_image            = var.worker_image
+  api_task_role_arn       = module.iam.api_task_role_arn
+  worker_task_role_arn    = module.iam.worker_task_role_arn
+  execution_role_arn      = module.iam.execution_role_arn
+  vpc_id                  = var.vpc_id
+  subnet_ids              = var.subnet_ids
+  public_subnet_ids       = var.public_subnet_ids
+  private_subnet_ids      = var.private_subnet_ids
+  private_route_table_ids = var.private_route_table_ids
+  enable_vpc_endpoints    = var.enable_vpc_endpoints
+  certificate_arn         = var.certificate_arn
+  sqs_queue_name          = module.sqs.queue_name
 
   # Injected directly into container task definitions
   app_environment_vars = {

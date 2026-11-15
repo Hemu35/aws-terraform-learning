@@ -77,6 +77,11 @@ output "alb_dns_name" {
   value       = module.ecs.alb_dns_name
 }
 
+output "alb_https_listener_arn" {
+  description = "ARN of the HTTPS ALB listener (null if certificate_arn is omitted)"
+  value       = module.ecs.alb_https_listener_arn
+}
+
 output "ecs_task_definition_arn" {
   description = "ECS API task definition ARN"
   value       = module.ecs.task_definition_arn

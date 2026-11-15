@@ -33,6 +33,7 @@ locals {
   api_task_role    = var.api_task_role_arn != "" ? var.api_task_role_arn : var.task_role_arn
   worker_task_role = var.worker_task_role_arn != "" ? var.worker_task_role_arn : var.task_role_arn
   alb_subnets      = length(var.public_subnet_ids) > 0 ? var.public_subnet_ids : var.subnet_ids
+  task_subnets     = length(var.private_subnet_ids) > 0 ? var.private_subnet_ids : var.subnet_ids
 }
 
 # CloudWatch log group
@@ -78,6 +79,14 @@ resource "aws_security_group" "alb" {
     description = "Public HTTP ingress"
     from_port   = 80
     to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "Public HTTPS ingress"
+    from_port   = 443
+    to_port     = 443
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
@@ -199,6 +208,36 @@ resource "aws_lb_listener" "http" {
   port              = 80
   protocol          = "HTTP"
 
+  dynamic "default_action" {
+    for_each = var.certificate_arn != "" ? [1] : []
+    content {
+      type = "redirect"
+
+      redirect {
+        port        = "443"
+        protocol    = "HTTPS"
+        status_code = "HTTP_301"
+      }
+    }
+  }
+
+  dynamic "default_action" {
+    for_each = var.certificate_arn == "" ? [1] : []
+    content {
+      type             = "forward"
+      target_group_arn = aws_lb_target_group.api.arn
+    }
+  }
+}
+
+resource "aws_lb_listener" "https" {
+  count             = var.certificate_arn != "" ? 1 : 0
+  load_balancer_arn = aws_lb.main.arn
+  port              = 443
+  protocol          = "HTTPS"
+  ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
+  certificate_arn   = var.certificate_arn
+
   default_action {
     type             = "forward"
     target_group_arn = aws_lb_target_group.api.arn
@@ -303,9 +342,9 @@ resource "aws_ecs_service" "api" {
   launch_type     = "FARGATE"
 
   network_configuration {
-    subnets          = var.subnet_ids
+    subnets          = local.task_subnets
     security_groups  = [aws_security_group.api.id]
-    assign_public_ip = true
+    assign_public_ip = false
   }
 
   load_balancer {
@@ -334,9 +373,9 @@ resource "aws_ecs_service" "worker" {
   launch_type     = "FARGATE"
 
   network_configuration {
-    subnets          = var.subnet_ids
+    subnets          = local.task_subnets
     security_groups  = [aws_security_group.worker.id]
-    assign_public_ip = true
+    assign_public_ip = false
   }
 
   deployment_minimum_healthy_percent = 50
@@ -452,6 +491,141 @@ resource "aws_cloudwatch_metric_alarm" "worker_cpu_high" {
   }
 
   tags = {
+    Project     = var.project_name
+    Environment = var.environment
+    ManagedBy   = "terraform"
+  }
+}
+
+# ============================================================
+# VPC Endpoints: Network Isolation without NAT Gateway
+# ============================================================
+
+# 1. Gateway Endpoints: Free of charge, route-table based
+resource "aws_vpc_endpoint" "s3" {
+  count             = var.enable_vpc_endpoints ? 1 : 0
+  vpc_id            = var.vpc_id
+  service_name      = "com.amazonaws.${var.aws_region}.s3"
+  vpc_endpoint_type = "Gateway"
+  route_table_ids   = var.private_route_table_ids
+
+  tags = {
+    Name        = "${var.project_name}-${var.environment}-s3-vpce"
+    Project     = var.project_name
+    Environment = var.environment
+    ManagedBy   = "terraform"
+  }
+}
+
+resource "aws_vpc_endpoint" "dynamodb" {
+  count             = var.enable_vpc_endpoints ? 1 : 0
+  vpc_id            = var.vpc_id
+  service_name      = "com.amazonaws.${var.aws_region}.dynamodb"
+  vpc_endpoint_type = "Gateway"
+  route_table_ids   = var.private_route_table_ids
+
+  tags = {
+    Name        = "${var.project_name}-${var.environment}-dynamodb-vpce"
+    Project     = var.project_name
+    Environment = var.environment
+    ManagedBy   = "terraform"
+  }
+}
+
+# 2. Interface Endpoints Security Group (inbound port 443 from API and Worker tasks)
+resource "aws_security_group" "vpc_endpoints" {
+  count       = var.enable_vpc_endpoints ? 1 : 0
+  name        = "${var.project_name}-${var.environment}-vpce-sg"
+  description = "Security group for VPC Interface Endpoints (SQS, ECR, CloudWatch Logs)"
+  vpc_id      = var.vpc_id
+
+  ingress {
+    description     = "Allow HTTPS from API and Worker tasks"
+    from_port       = 443
+    to_port         = 443
+    protocol        = "tcp"
+    security_groups = [aws_security_group.api.id, aws_security_group.worker.id]
+  }
+
+  egress {
+    description = "Allow all outbound traffic from interface endpoints"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name        = "${var.project_name}-${var.environment}-vpce-sg"
+    Project     = var.project_name
+    Environment = var.environment
+    ManagedBy   = "terraform"
+  }
+}
+
+# 3. Interface Endpoints: Private AWS API connectivity for tasks in private subnets
+resource "aws_vpc_endpoint" "sqs" {
+  count               = var.enable_vpc_endpoints ? 1 : 0
+  vpc_id              = var.vpc_id
+  service_name        = "com.amazonaws.${var.aws_region}.sqs"
+  vpc_endpoint_type   = "Interface"
+  private_dns_enabled = true
+  subnet_ids          = local.task_subnets
+  security_group_ids  = [aws_security_group.vpc_endpoints[0].id]
+
+  tags = {
+    Name        = "${var.project_name}-${var.environment}-sqs-vpce"
+    Project     = var.project_name
+    Environment = var.environment
+    ManagedBy   = "terraform"
+  }
+}
+
+resource "aws_vpc_endpoint" "ecr_api" {
+  count               = var.enable_vpc_endpoints ? 1 : 0
+  vpc_id              = var.vpc_id
+  service_name        = "com.amazonaws.${var.aws_region}.ecr.api"
+  vpc_endpoint_type   = "Interface"
+  private_dns_enabled = true
+  subnet_ids          = local.task_subnets
+  security_group_ids  = [aws_security_group.vpc_endpoints[0].id]
+
+  tags = {
+    Name        = "${var.project_name}-${var.environment}-ecr-api-vpce"
+    Project     = var.project_name
+    Environment = var.environment
+    ManagedBy   = "terraform"
+  }
+}
+
+resource "aws_vpc_endpoint" "ecr_dkr" {
+  count               = var.enable_vpc_endpoints ? 1 : 0
+  vpc_id              = var.vpc_id
+  service_name        = "com.amazonaws.${var.aws_region}.ecr.dkr"
+  vpc_endpoint_type   = "Interface"
+  private_dns_enabled = true
+  subnet_ids          = local.task_subnets
+  security_group_ids  = [aws_security_group.vpc_endpoints[0].id]
+
+  tags = {
+    Name        = "${var.project_name}-${var.environment}-ecr-dkr-vpce"
+    Project     = var.project_name
+    Environment = var.environment
+    ManagedBy   = "terraform"
+  }
+}
+
+resource "aws_vpc_endpoint" "logs" {
+  count               = var.enable_vpc_endpoints ? 1 : 0
+  vpc_id              = var.vpc_id
+  service_name        = "com.amazonaws.${var.aws_region}.logs"
+  vpc_endpoint_type   = "Interface"
+  private_dns_enabled = true
+  subnet_ids          = local.task_subnets
+  security_group_ids  = [aws_security_group.vpc_endpoints[0].id]
+
+  tags = {
+    Name        = "${var.project_name}-${var.environment}-logs-vpce"
     Project     = var.project_name
     Environment = var.environment
     ManagedBy   = "terraform"

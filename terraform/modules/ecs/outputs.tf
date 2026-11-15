@@ -42,3 +42,28 @@ output "task_definition_arn" {
   description = "Backward-compatible alias for api_task_definition_arn"
   value       = aws_ecs_task_definition.api.arn
 }
+
+output "alb_https_listener_arn" {
+  description = "ARN of the HTTPS ALB listener on port 443 (null if certificate_arn was not provided)"
+  value       = try(aws_lb_listener.https[0].arn, null)
+}
+
+output "vpc_endpoints_security_group_id" {
+  description = "Security group ID for VPC Interface Endpoints"
+  value       = try(aws_security_group.vpc_endpoints[0].id, null)
+}
+
+output "s3_vpc_endpoint_id" {
+  description = "ID of the S3 Gateway VPC Endpoint"
+  value       = try(aws_vpc_endpoint.s3[0].id, null)
+}
+
+output "dynamodb_vpc_endpoint_id" {
+  description = "ID of the DynamoDB Gateway VPC Endpoint"
+  value       = try(aws_vpc_endpoint.dynamodb[0].id, null)
+}
+
+output "sqs_vpc_endpoint_id" {
+  description = "ID of the SQS Interface VPC Endpoint"
+  value       = try(aws_vpc_endpoint.sqs[0].id, null)
+}

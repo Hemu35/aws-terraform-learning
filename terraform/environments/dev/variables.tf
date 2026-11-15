@@ -23,9 +23,39 @@ variable "vpc_id" {
 }
 
 variable "subnet_ids" {
-  description = "List of public subnet IDs for ECS tasks (required for real AWS deployment)"
+  description = "Fallback subnet IDs for backwards compatibility"
   type        = list(string)
   default     = ["subnet-placeholder-1", "subnet-placeholder-2"]
+}
+
+variable "public_subnet_ids" {
+  description = "List of public subnet IDs for the ALB (public ingress)"
+  type        = list(string)
+  default     = ["subnet-placeholder-pub-1", "subnet-placeholder-pub-2"]
+}
+
+variable "private_subnet_ids" {
+  description = "List of private subnet IDs for ECS tasks (API and Worker) with assign_public_ip = false"
+  type        = list(string)
+  default     = ["subnet-placeholder-priv-1", "subnet-placeholder-priv-2"]
+}
+
+variable "private_route_table_ids" {
+  description = "List of private route table IDs for S3 and DynamoDB VPC Gateway Endpoints"
+  type        = list(string)
+  default     = []
+}
+
+variable "certificate_arn" {
+  description = "ACM Certificate ARN for ALB HTTPS listener on port 443 (optional)"
+  type        = string
+  default     = ""
+}
+
+variable "enable_vpc_endpoints" {
+  description = "Whether to provision VPC Endpoints for private subnet isolation"
+  type        = bool
+  default     = true
 }
 
 variable "api_image" {

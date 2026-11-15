@@ -30,10 +30,17 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, Form, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Header, UploadFile
 
 from app.core.config import Settings, get_settings
-from app.core.exceptions import DataIntegrityError, InvalidFileTypeError, PayloadTooLargeError
+from app.core.exceptions import (
+    DataIntegrityError,
+    InvalidFileTypeError,
+    JobAlreadyExistsError,
+    JobNotFoundError,
+    PayloadTooLargeError,
+    QueueError,
+)
 from app.core.logging_config import get_logger
 from app.models.job import DynamoDBJobItem, JobResponse, JobStatus, JobSubmitResponse
 from app.services.dynamodb_service import DynamoDBService
@@ -109,6 +116,14 @@ async def submit_job(
         str | None,
         Form(description="Override the uploaded filename"),
     ] = None,
+    idempotency_key: Annotated[
+        str | None,
+        Header(alias="Idempotency-Key", description="Optional client idempotency key for deduplication"),
+    ] = None,
+    x_idempotency_key: Annotated[
+        str | None,
+        Header(alias="X-Idempotency-Key", description="Alternative client idempotency key header"),
+    ] = None,
     settings: Settings = Depends(get_settings_dep),
     dynamodb_service: DynamoDBService = Depends(get_dynamodb_service),
     s3_service: S3Service = Depends(get_s3_service),
@@ -126,6 +141,10 @@ async def submit_job(
     Production safeguards:
     - Content-type validation against allowed whitelist
     - Chunked streaming upload size enforcement to prevent memory exhaustion (DoS/OOM)
+    - Client idempotency key support (Idempotency-Key / X-Idempotency-Key)
+    - Streaming upload directly to S3 before DynamoDB record creation
+    - Atomic DynamoDB job creation with s3_input_key already populated
+    - SQS enqueue wrapped with DynamoDB rollback to FAILED on queue errors
     - Synchronous Boto3 SDK calls offloaded to worker threadpool via asyncio.to_thread
     - TTL expires_at metadata set on DynamoDB record
     """
@@ -163,8 +182,33 @@ async def submit_job(
 
         spool.seek(0)
 
-        # 3. Job creation with TTL
-        job_id = str(uuid.uuid4())
+        # 3. Client Idempotency Check
+        client_key = idempotency_key or x_idempotency_key
+        if client_key:
+            job_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"urn:job:{client_key}"))
+            try:
+                existing_job = await asyncio.to_thread(dynamodb_service.get_job, job_id)
+                logger.info(
+                    "Idempotent job submission: returning existing job",
+                    extra={"job_id": job_id, "idempotency_key": client_key, "status": existing_job.status},
+                )
+                return JobSubmitResponse(
+                    job_id=existing_job.job_id,
+                    status=existing_job.status,
+                    message="Job already submitted (idempotent request)",
+                )
+            except JobNotFoundError:
+                pass
+        else:
+            job_id = str(uuid.uuid4())
+
+        # 4. Stream document to S3 without loading whole file into memory
+        # We upload to S3 first so no incomplete/empty-key record is stored in DynamoDB
+        s3_key = await asyncio.to_thread(
+            s3_service.upload_fileobj, job_id, effective_filename, spool, content_type, total_bytes
+        )
+
+        # 5. Atomic Job creation with TTL and s3_input_key populated
         now = datetime.now(tz=timezone.utc)
         expires_at = int((now + timedelta(seconds=settings.job_ttl_seconds)).timestamp())
 
@@ -174,23 +218,31 @@ async def submit_job(
             filename=effective_filename,
             created_at=now,
             updated_at=now,
-            s3_input_key="",  # will be updated after S3 upload
+            s3_input_key=s3_key,
             expires_at=expires_at,
         )
 
-        logger.info("Submitting new document processing job", extra={"job_id": job_id, "size_bytes": total_bytes})
-
-        # Execute blocking Boto3 calls in a separate thread so the FastAPI async loop remains non-blocking
-        await asyncio.to_thread(dynamodb_service.create_job, job_item)
-
-        # 4. Stream document to S3 without loading whole file into memory
+        logger.info(
+            "Creating job record in DynamoDB", extra={"job_id": job_id, "s3_key": s3_key, "size_bytes": total_bytes}
+        )
         try:
-            s3_key = await asyncio.to_thread(
-                s3_service.upload_fileobj, job_id, effective_filename, spool, content_type, total_bytes
-            )
+            await asyncio.to_thread(dynamodb_service.create_job, job_item)
+        except JobAlreadyExistsError:
+            if client_key:
+                existing_job = await asyncio.to_thread(dynamodb_service.get_job, job_id)
+                return JobSubmitResponse(
+                    job_id=existing_job.job_id,
+                    status=existing_job.status,
+                    message="Job already submitted (idempotent request)",
+                )
+            raise
+
+        # 6. Enqueue the job for the worker with safe rollback on SQS failure
+        try:
+            await asyncio.to_thread(sqs_service.send_job, job_id)
         except Exception as exc:
             logger.error(
-                "S3 document upload failed — marking job FAILED to prevent dangling PENDING record",
+                "SQS job enqueue failed — marking job FAILED in DynamoDB to prevent orphaned PENDING record",
                 extra={"job_id": job_id, "error": str(exc)},
             )
             try:
@@ -198,17 +250,16 @@ async def submit_job(
                     dynamodb_service.update_job_status,
                     job_id=job_id,
                     status=JobStatus.FAILED,
-                    error_message="S3 document upload failed",
+                    error_message="Failed to enqueue job to SQS",
                 )
-            except Exception:
-                pass
-            raise
-
-        # 5. Persist the S3 key back to DynamoDB
-        await asyncio.to_thread(_set_s3_input_key, dynamodb_service, job_id, s3_key)
-
-        # 6. Enqueue the job for the worker
-        await asyncio.to_thread(sqs_service.send_job, job_id)
+            except Exception as ddb_err:
+                logger.error(
+                    "Failed to update job status to FAILED after SQS failure",
+                    extra={"job_id": job_id, "error": str(ddb_err)},
+                )
+            if isinstance(exc, QueueError):
+                raise
+            raise QueueError(f"Failed to enqueue job to SQS: {exc}") from exc
 
     logger.info("Job successfully queued", extra={"job_id": job_id, "s3_key": s3_key})
 
