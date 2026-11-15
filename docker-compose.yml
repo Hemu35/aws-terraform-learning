@@ -1,0 +1,82 @@
+version: "3.9"
+
+services:
+  # ── LocalStack (AWS simulation) ──────────────────────────────────────────────
+  localstack:
+    image: localstack/localstack:3.6
+    container_name: localstack
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: s3,sqs,dynamodb
+      DEFAULT_REGION: us-east-1
+      AWS_DEFAULT_REGION: us-east-1
+      PERSISTENCE: 1
+    volumes:
+      - localstack-data:/var/lib/localstack
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  # ── LocalStack resource bootstrap ───────────────────────────────────────────
+  localstack-setup:
+    image: amazon/aws-cli:2.17.0
+    container_name: localstack-setup
+    depends_on:
+      localstack:
+        condition: service_healthy
+    environment:
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_ENDPOINT_URL: http://localstack:4566
+    volumes:
+      - ./scripts:/scripts
+    entrypoint: ["/bin/sh", "/scripts/setup-localstack.sh"]
+    restart: on-failure
+
+  # ── FastAPI ──────────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: api
+    ports:
+      - "8000:8000"
+    depends_on:
+      localstack-setup:
+        condition: service_completed_successfully
+    env_file:
+      - .env
+    environment:
+      # Override so the container talks to LocalStack service, not localhost
+      AWS_ENDPOINT_URL: http://localstack:4566
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  # ── Background Worker ────────────────────────────────────────────────────────
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: worker
+    depends_on:
+      api:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      AWS_ENDPOINT_URL: http://localstack:4566
+    restart: unless-stopped
+
+volumes:
+  localstack-data:

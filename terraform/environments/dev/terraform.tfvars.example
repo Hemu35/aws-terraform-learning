@@ -1,0 +1,5 @@
+project_name = "doc-processor"
+environment  = "dev"
+aws_region   = "us-east-1"
+# vpc_id     = "vpc-xxxx"   # fill before applying
+# subnet_ids = ["subnet-xxxx"]

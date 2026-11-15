@@ -1,0 +1,12 @@
+.git
+__pycache__
+*.pyc
+*.pyo
+.env
+*.egg-info
+.pytest_cache
+htmlcov
+terraform/
+.mypy_cache
+.venv
+dist/
