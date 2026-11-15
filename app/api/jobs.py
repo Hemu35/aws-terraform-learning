@@ -176,6 +176,9 @@ async def get_job_status(
         # regenerate a fresh one so it never expires for the caller.
         result_key = f"{job_id}/output/result.json"
         result_url = s3_service.generate_presigned_url(result_key)
+        # In local Docker Compose, translate internal container host to localhost for host clients
+        if result_url and "http://localstack:4566" in result_url:
+            result_url = result_url.replace("http://localstack:4566", "http://localhost:4566")
 
     return JobResponse(
         job_id=job_item.job_id,

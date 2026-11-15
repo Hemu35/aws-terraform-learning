@@ -6,8 +6,9 @@ WORKDIR /build
 # Install build tools
 RUN pip install --upgrade pip hatchling
 
-# Copy dependency manifests only (layer-cache friendly)
+# Copy dependency manifests and app code
 COPY pyproject.toml ./
+COPY app/ ./app/
 
 # Install runtime dependencies into an isolated prefix so Stage 2 stays clean
 RUN pip install --prefix=/install --no-cache-dir .

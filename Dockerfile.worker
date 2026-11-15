@@ -6,6 +6,7 @@ WORKDIR /build
 RUN pip install --upgrade pip hatchling
 
 COPY pyproject.toml ./
+COPY app/ ./app/
 
 RUN pip install --prefix=/install --no-cache-dir .
 

@@ -55,6 +55,7 @@ services:
     environment:
       # Override so the container talks to LocalStack service, not localhost
       AWS_ENDPOINT_URL: http://localstack:4566
+      SQS_QUEUE_URL: http://localstack:4566/000000000000/jobs-queue
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 15s
@@ -76,6 +77,7 @@ services:
       - .env
     environment:
       AWS_ENDPOINT_URL: http://localstack:4566
+      SQS_QUEUE_URL: http://localstack:4566/000000000000/jobs-queue
     restart: unless-stopped
 
 volumes:
