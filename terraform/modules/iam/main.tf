@@ -73,7 +73,8 @@ data "aws_iam_policy_document" "ecs_task_permissions" {
       "sqs:SendMessage",
       "sqs:ReceiveMessage",
       "sqs:DeleteMessage",
-      "sqs:GetQueueAttributes", # Required by boto3 SDK for queue introspection
+      "sqs:ChangeMessageVisibility", # Required by heartbeat to extend visibility & prevent redelivery loops
+      "sqs:GetQueueAttributes",      # Required by boto3 SDK for queue introspection
     ]
     resources = [var.sqs_queue_arn]
   }

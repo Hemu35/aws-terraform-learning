@@ -596,3 +596,175 @@ def test_visibility_heartbeat_renews_dynamodb_lease():
     assert renewed_job.lease_expires_at is not None
     assert initial_exp is not None
     assert renewed_job.lease_expires_at > initial_exp
+
+
+# ===========================================================================
+# Phase 3.2: Distributed Systems and Production Readiness Audit Tests
+# ===========================================================================
+
+
+@mock_aws
+def test_already_active_message_adjusts_visibility_to_prevent_tight_loop():
+    """An active lease adjusts message visibility delay so SQS does not enter a tight redelivery loop."""
+    settings = _create_test_settings()
+    _bootstrap_mock_aws(settings)
+
+    dynamo = DynamoDBService(settings)
+    job_id = "tight-loop-prevention-job"
+    now = datetime.now(tz=timezone.utc)
+    dynamo.create_job(
+        DynamoDBJobItem(
+            job_id=job_id,
+            status=JobStatus.PENDING,
+            filename="test.txt",
+            created_at=now,
+            updated_at=now,
+            s3_input_key="path/test.txt",
+        )
+    )
+
+    # Worker A acquires lease for 60 seconds
+    dynamo.acquire_job_lease(job_id, worker_id="worker-A", lease_duration_seconds=60)
+
+    # Worker B receives message
+    processor_b = JobProcessor(settings, worker_id="worker-B")
+    mock_sqs = MagicMock()
+    processor_b._sqs = mock_sqs
+
+    should_delete = processor_b.process_job(job_id, receipt_handle="active-msg-handle")
+
+    assert should_delete is False  # Message retained in SQS
+    # SQS visibility must have been extended/delayed to match remaining lease
+    assert mock_sqs.change_message_visibility.called
+    args, _ = mock_sqs.change_message_visibility.call_args
+    assert args[0] == "active-msg-handle"
+    assert args[1] >= 10  # Backoff delay in seconds
+
+
+@mock_aws
+def test_stale_worker_s3_write_rejected_by_fencing():
+    """A stale worker cannot publish its S3 output key as authoritative over a newer worker."""
+    settings = _create_test_settings()
+    _bootstrap_mock_aws(settings)
+
+    dynamo = DynamoDBService(settings)
+    job_id = "stale-s3-write-job"
+    now = datetime.now(tz=timezone.utc)
+    dynamo.create_job(
+        DynamoDBJobItem(
+            job_id=job_id,
+            status=JobStatus.PENDING,
+            filename="test.txt",
+            created_at=now,
+            updated_at=now,
+            s3_input_key="path/test.txt",
+        )
+    )
+
+    # Worker A acquires v1
+    dynamo.acquire_job_lease(job_id, worker_id="worker-A", lease_duration_seconds=60)
+
+    # Backdate lease to simulate stall and expiry
+    past_timestamp = int(datetime.now(tz=timezone.utc).timestamp()) - 10
+    dynamo._table.update_item(
+        Key={"job_id": job_id},
+        UpdateExpression="SET lease_expires_at = :past",
+        ExpressionAttributeValues={":past": past_timestamp},
+    )
+
+    # Worker B acquires v2 and completes
+    dynamo.acquire_job_lease(job_id, worker_id="worker-B", lease_duration_seconds=60)
+    completed_b = dynamo.complete_job_with_lease(
+        job_id=job_id,
+        worker_id="worker-B",
+        processing_version=2,
+        s3_output_key=f"{job_id}/output/result_v2.json",
+    )
+    assert completed_b is True
+
+    # Stale Worker A wakes up and attempts to complete with v1 and its output key
+    completed_a = dynamo.complete_job_with_lease(
+        job_id=job_id,
+        worker_id="worker-A",
+        processing_version=1,
+        s3_output_key=f"{job_id}/output/result_v1_stale.json",
+    )
+    assert completed_a is False  # Rejected by fencing token
+
+    # The authoritative record in DynamoDB remains Worker B's result
+    authoritative = dynamo.get_job(job_id)
+    assert authoritative.status == JobStatus.COMPLETED
+    assert authoritative.worker_id == "worker-B"
+    assert authoritative.s3_output_key == f"{job_id}/output/result_v2.json"
+
+
+def test_visibility_heartbeat_failure_handling():
+    """Heartbeat handles transient SQS or DynamoDB network exceptions without crashing."""
+    mock_sqs = MagicMock()
+    mock_sqs.change_message_visibility.side_effect = RuntimeError("SQS transient error")
+    mock_dynamo = MagicMock()
+    mock_dynamo.renew_job_lease.side_effect = RuntimeError("DynamoDB transient error")
+
+    with VisibilityHeartbeat(
+        sqs=mock_sqs,
+        receipt_handle="dummy-receipt",
+        interval_seconds=0.04,
+        extension_seconds=60,
+        dynamo=mock_dynamo,
+        job_id="dummy-job",
+        worker_id="dummy-worker",
+        processing_version=1,
+    ) as hb:
+        time.sleep(0.1)
+        # Even with exceptions in background thread, is_fenced_out is False
+        # and the worker process is not terminated
+        assert not hb.is_fenced_out
+
+
+def test_worker_graceful_shutdown_flag():
+    """Worker processor respects _shutdown_requested flag and terminates loop cleanly."""
+    settings = _create_test_settings()
+    processor = JobProcessor(settings)
+    processor._shutdown_requested = True
+
+    # Calling run() with shutdown requested must exit immediately without looping
+    processor.run()
+    assert processor._shutdown_requested is True
+
+
+@pytest.mark.asyncio
+async def test_api_get_job_uses_authoritative_s3_output_key():
+    """API GET /jobs/{job_id} generates presigned URL from the authoritative s3_output_key stored in DynamoDB."""
+    with mock_aws():
+        settings = _create_test_settings()
+        _bootstrap_mock_aws(settings)
+        app.dependency_overrides[get_settings_dep] = lambda: settings
+
+        dynamo = DynamoDBService(settings)
+        job_id = "test-authoritative-key-job"
+        now = datetime.now(tz=timezone.utc)
+        dynamo.create_job(
+            DynamoDBJobItem(
+                job_id=job_id,
+                status=JobStatus.COMPLETED,
+                filename="document.pdf",
+                created_at=now,
+                updated_at=now,
+                s3_input_key="path/input.pdf",
+                s3_output_key=f"{job_id}/output/result_v2_authoritative.json",
+            )
+        )
+
+        try:
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                response = await client.get(f"/api/v1/jobs/{job_id}")
+
+            assert response.status_code == 200
+            data = response.json()
+            assert data["status"] == "COMPLETED"
+            assert data["result_url"] is not None
+            # Presigned URL must target the authoritative versioned object
+            assert f"{job_id}/output/result_v2_authoritative.json" in data["result_url"]
+        finally:
+            app.dependency_overrides.clear()

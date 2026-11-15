@@ -140,6 +140,7 @@ class JobProcessor:
         self._s3 = S3Service(settings)
         self._sqs = SQSService(settings)
         self._dynamo = DynamoDBService(settings)
+        self._shutdown_requested = False
 
     # ------------------------------------------------------------------
     # Core processing logic
@@ -233,6 +234,21 @@ class JobProcessor:
                 "Job actively owned by another worker with valid lease — retaining message in SQS for future recovery",
                 extra={"job_id": job_id},
             )
+            # Prevent tight redelivery loops: delay next redelivery until the active lease expires + buffer
+            if receipt_handle and job_item and job_item.lease_expires_at:
+                now_ts = int(datetime.now(tz=timezone.utc).timestamp())
+                delay = max(10, job_item.lease_expires_at - now_ts + 5)
+                try:
+                    self._sqs.change_message_visibility(receipt_handle, delay)
+                    logger.debug(
+                        "Delayed SQS redelivery for active lease",
+                        extra={"job_id": job_id, "delay_seconds": delay},
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Could not adjust visibility for ALREADY_ACTIVE message",
+                        extra={"job_id": job_id, "error": str(exc)},
+                    )
             return False
 
         if acquire_result == AcquireResult.MAX_ATTEMPTS_EXCEEDED:
@@ -364,14 +380,31 @@ class JobProcessor:
           - Returns ``True``: message was processed, completed, or terminally failed -> delete message.
           - Returns ``False``: job is actively owned by another healthy worker or worker was fenced out -> DO NOT delete message.
         - Unhandled exceptions delete the message to avoid poison-pill queue block.
-        - ``KeyboardInterrupt`` is caught for graceful Ctrl-C shutdown.
+        - Supports graceful termination via SIGTERM/SIGINT.
         """
         logger.info(
             "Worker starting — polling SQS for jobs",
             extra={"worker_id": self.worker_id},
         )
+
         try:
-            while True:
+            import signal
+
+            def _signal_handler(signum: int, frame: Any) -> None:
+                logger.info(
+                    "Shutdown signal received (SIGTERM/SIGINT) — finishing current iteration",
+                    extra={"signal": signum, "worker_id": self.worker_id},
+                )
+                self._shutdown_requested = True
+
+            signal.signal(signal.SIGTERM, _signal_handler)
+            signal.signal(signal.SIGINT, _signal_handler)
+        except (ValueError, AttributeError):
+            # Raised if executed in non-main thread (e.g. unit tests)
+            pass
+
+        try:
+            while not self._shutdown_requested:
                 messages = self._sqs.receive_messages()
                 if not messages:
                     logger.debug("No messages received — continuing poll")
