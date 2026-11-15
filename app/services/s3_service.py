@@ -101,6 +101,73 @@ class S3Service:
         )
         return s3_key
 
+    def upload_fileobj(
+        self,
+        job_id: str,
+        filename: str,
+        fileobj: Any,
+        content_type: str = "application/octet-stream",
+        size_bytes: Optional[int] = None,
+    ) -> str:
+        """Stream a document from a file-like object to S3 without retaining it in RAM.
+
+        Parameters
+        ----------
+        job_id:
+            Unique job identifier — used as the key prefix.
+        filename:
+            Original filename; appended to the key.
+        fileobj:
+            File-like object supporting read() (e.g. SpooledTemporaryFile or open file handle).
+        content_type:
+            MIME type for the S3 object.
+        size_bytes:
+            Optional size in bytes for logging.
+
+        Returns
+        -------
+        str
+            The S3 key the object was stored under.
+
+        Raises
+        ------
+        StorageError
+            On any S3 / network failure.
+        """
+        s3_key = f"{job_id}/input/{filename}"
+        logger.info(
+            "Streaming document to S3 via upload_fileobj",
+            extra={
+                "job_id": job_id,
+                "s3_key": s3_key,
+                "bucket": self.bucket_name,
+                "content_type": content_type,
+                "size_bytes": size_bytes,
+            },
+        )
+        try:
+            self._client.upload_fileobj(
+                Fileobj=fileobj,
+                Bucket=self.bucket_name,
+                Key=s3_key,
+                ExtraArgs={"ContentType": content_type},
+            )
+        except Exception as exc:
+            logger.error(
+                "Failed to stream document to S3",
+                extra={"job_id": job_id, "s3_key": s3_key, "error": str(exc)},
+            )
+            raise StorageError(
+                f"Failed to stream document for job {job_id}",
+                details={"s3_key": s3_key, "error": str(exc)},
+            ) from exc
+
+        logger.info(
+            "Document streamed to S3 successfully",
+            extra={"job_id": job_id, "s3_key": s3_key},
+        )
+        return s3_key
+
     def upload_result(self, job_id: str, result: dict, version: Optional[int] = None) -> str:
         """Persist a processing result dict as JSON to S3.
 

@@ -3,6 +3,11 @@ output "queue_url" {
   value       = aws_sqs_queue.main.url
 }
 
+output "queue_name" {
+  description = "Name of the main SQS queue"
+  value       = aws_sqs_queue.main.name
+}
+
 output "queue_arn" {
   description = "ARN of the main SQS queue — used in IAM policies"
   value       = aws_sqs_queue.main.arn

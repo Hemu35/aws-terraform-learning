@@ -82,3 +82,18 @@ class InvalidFileTypeError(AppError):
             message=f"File content type '{content_type}' is not supported. Allowed: {allowed_types}",
             details=details or {"content_type": content_type, "allowed_types": allowed_types},
         )
+
+
+class DataIntegrityError(AppError):
+    """Raised when a completed job is missing required authoritative artifacts or metadata."""
+
+    def __init__(
+        self,
+        job_id: str,
+        message: str = "Completed job record is missing authoritative S3 output key",
+        details: Optional[dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(
+            message=f"Data integrity error for job '{job_id}': {message}",
+            details=details or {"job_id": job_id},
+        )

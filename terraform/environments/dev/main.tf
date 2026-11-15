@@ -98,16 +98,18 @@ module "iam" {
 module "ecs" {
   source = "../../modules/ecs"
 
-  cluster_name       = "${var.project_name}-${var.environment}-cluster"
-  project_name       = var.project_name
-  environment        = var.environment
-  aws_region         = var.aws_region
-  api_image          = var.api_image
-  worker_image       = var.worker_image
-  task_role_arn      = module.iam.task_role_arn
-  execution_role_arn = module.iam.execution_role_arn
-  vpc_id             = var.vpc_id
-  subnet_ids         = var.subnet_ids
+  cluster_name         = "${var.project_name}-${var.environment}-cluster"
+  project_name         = var.project_name
+  environment          = var.environment
+  aws_region           = var.aws_region
+  api_image            = var.api_image
+  worker_image         = var.worker_image
+  api_task_role_arn    = module.iam.api_task_role_arn
+  worker_task_role_arn = module.iam.worker_task_role_arn
+  execution_role_arn   = module.iam.execution_role_arn
+  vpc_id               = var.vpc_id
+  subnet_ids           = var.subnet_ids
+  sqs_queue_name       = module.sqs.queue_name
 
   # Injected directly into container task definitions
   app_environment_vars = {

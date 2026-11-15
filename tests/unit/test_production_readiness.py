@@ -284,7 +284,7 @@ async def test_api_s3_upload_failure_returns_503():
         app.dependency_overrides[get_settings_dep] = lambda: settings
 
         try:
-            with patch.object(S3Service, "upload_document", side_effect=StorageError("S3 connection timeout")):
+            with patch.object(S3Service, "upload_fileobj", side_effect=StorageError("S3 connection timeout")):
                 transport = ASGITransport(app=app)
                 async with AsyncClient(transport=transport, base_url="http://test") as client:
                     files = {"file": ("report.pdf", io.BytesIO(b"Valid PDF Content"), "application/pdf")}
@@ -766,5 +766,210 @@ async def test_api_get_job_uses_authoritative_s3_output_key():
             assert data["result_url"] is not None
             # Presigned URL must target the authoritative versioned object
             assert f"{job_id}/output/result_v2_authoritative.json" in data["result_url"]
+        finally:
+            app.dependency_overrides.clear()
+
+
+# ===========================================================================
+# Phase 3.3: Production Architecture Hardening Tests
+# ===========================================================================
+
+
+def test_heartbeat_conditional_renewal_failure_fences_out_worker():
+    """DynamoDB conditional renewal failure immediately fences out the worker and terminates thread."""
+    mock_sqs = MagicMock()
+    mock_dynamo = MagicMock()
+    # ConditionalCheckFailedException -> renew_job_lease returns False
+    mock_dynamo.renew_job_lease.return_value = False
+
+    hb = VisibilityHeartbeat(
+        sqs=mock_sqs,
+        receipt_handle="dummy-receipt",
+        interval_seconds=0.03,
+        extension_seconds=60,
+        dynamo=mock_dynamo,
+        job_id="job-fence-test",
+        worker_id="worker-fence",
+        processing_version=1,
+    )
+    with hb:
+        time.sleep(0.08)
+
+    # Must be fenced out
+    assert hb.is_fenced_out is True
+    # Thread must have terminated cleanly
+    if hb._thread:
+        assert not hb._thread.is_alive()
+
+
+def test_heartbeat_single_transient_failure_recovers_on_next_tick():
+    """A single transient network failure does not fence out the worker if the next tick succeeds."""
+    mock_sqs = MagicMock()
+    mock_dynamo = MagicMock()
+    # 1st call fails with transient error, 2nd call succeeds
+    mock_dynamo.renew_job_lease.side_effect = [RuntimeError("Transient 503"), True, True]
+
+    hb = VisibilityHeartbeat(
+        sqs=mock_sqs,
+        receipt_handle="dummy-receipt",
+        interval_seconds=0.03,
+        extension_seconds=60,
+        dynamo=mock_dynamo,
+        job_id="job-transient-test",
+        worker_id="worker-transient",
+        processing_version=1,
+        max_consecutive_failures=3,
+    )
+    with hb:
+        time.sleep(0.09)
+
+    # Must NOT be fenced out because renewal succeeded after transient error
+    assert hb.is_fenced_out is False
+
+
+def test_heartbeat_repeated_transient_failures_fences_out_worker():
+    """Repeated transient network failures reaching max_consecutive_failures fence out worker."""
+    mock_sqs = MagicMock()
+    mock_dynamo = MagicMock()
+    # Fails every time
+    mock_dynamo.renew_job_lease.side_effect = RuntimeError("Continuous network partition")
+
+    hb = VisibilityHeartbeat(
+        sqs=mock_sqs,
+        receipt_handle="dummy-receipt",
+        interval_seconds=0.02,
+        extension_seconds=60,
+        dynamo=mock_dynamo,
+        job_id="job-repeated-fail-test",
+        worker_id="worker-repeated",
+        processing_version=1,
+        max_consecutive_failures=3,
+    )
+    with hb:
+        time.sleep(0.12)
+
+    # Exceeded max_consecutive_failures -> worker is fenced out
+    assert hb.is_fenced_out is True
+    # Heartbeat thread terminates cleanly
+    if hb._thread:
+        assert not hb._thread.is_alive()
+
+
+@mock_aws
+def test_fenced_out_worker_aborts_before_s3_and_cannot_complete():
+    """A worker fenced out during processing aborts immediately and does not publish S3 results or complete."""
+    settings = _create_test_settings()
+    _bootstrap_mock_aws(settings)
+
+    dynamo = DynamoDBService(settings)
+    s3 = S3Service(settings)
+    job_id = "fenced-abort-job"
+    now = datetime.now(tz=timezone.utc)
+    s3_key = s3.upload_document(job_id, "doc.txt", b"Aborted content", "text/plain")
+
+    dynamo.create_job(
+        DynamoDBJobItem(
+            job_id=job_id,
+            status=JobStatus.PENDING,
+            filename="doc.txt",
+            created_at=now,
+            updated_at=now,
+            s3_input_key=s3_key,
+        )
+    )
+
+    processor = JobProcessor(settings, worker_id="worker-slow")
+
+    # Patch simulate_processing to inject lease expiry / fencing mid-execution
+    def _simulated_slow_processing(*args, **kwargs):
+        # Backdate lease so worker-slow's lease expires
+        past_ts = int(datetime.now(tz=timezone.utc).timestamp()) - 10
+        dynamo._table.update_item(
+            Key={"job_id": job_id},
+            UpdateExpression="SET lease_expires_at = :past",
+            ExpressionAttributeValues={":past": past_ts},
+        )
+        # Another worker claims lease v2 and completes
+        res, _ = dynamo.acquire_job_lease(job_id, worker_id="worker-fast", lease_duration_seconds=60)
+        assert res == AcquireResult.ACQUIRED
+        dynamo.complete_job_with_lease(
+            job_id,
+            worker_id="worker-fast",
+            processing_version=2,
+            s3_output_key=f"{job_id}/output/result_v2.json",
+        )
+        return {"word_count": 2}
+
+    with patch.object(processor, "_simulate_processing", side_effect=_simulated_slow_processing):
+        should_delete = processor.process_job(job_id)
+
+    # Worker-slow must return False because it was fenced out
+    assert should_delete is False
+
+    # The authoritative record in DynamoDB remains worker-fast's version 2
+    job = dynamo.get_job(job_id)
+    assert job.status == JobStatus.COMPLETED
+    assert job.worker_id == "worker-fast"
+    assert job.processing_version == 2
+    assert job.s3_output_key == f"{job_id}/output/result_v2.json"
+
+
+@pytest.mark.asyncio
+async def test_api_completed_job_missing_output_key_returns_500():
+    """A COMPLETED job without an authoritative s3_output_key returns HTTP 500 (Data Integrity Error)."""
+    with mock_aws():
+        settings = _create_test_settings()
+        _bootstrap_mock_aws(settings)
+        app.dependency_overrides[get_settings_dep] = lambda: settings
+
+        dynamo = DynamoDBService(settings)
+        job_id = "job-corrupted-missing-key"
+        now = datetime.now(tz=timezone.utc)
+        dynamo.create_job(
+            DynamoDBJobItem(
+                job_id=job_id,
+                status=JobStatus.COMPLETED,
+                filename="document.pdf",
+                created_at=now,
+                updated_at=now,
+                s3_input_key="path/input.pdf",
+                s3_output_key=None,  # Missing authoritative key!
+            )
+        )
+
+        try:
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                response = await client.get(f"/api/v1/jobs/{job_id}")
+
+            # Must return HTTP 500 and not guess a fallback URL
+            assert response.status_code == 500
+            data = response.json()
+            assert data["error_code"] == "DATA_INTEGRITY_ERROR"
+            assert "authoritative S3 output key" in data["detail"]
+        finally:
+            app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_api_upload_s3_failure_marks_job_failed():
+    """When S3 document streaming fails, DynamoDB job is marked FAILED rather than dangling in PENDING."""
+    with mock_aws():
+        settings = _create_test_settings()
+        _bootstrap_mock_aws(settings)
+        app.dependency_overrides[get_settings_dep] = lambda: settings
+
+        dynamo = DynamoDBService(settings)
+
+        try:
+            with patch.object(S3Service, "upload_fileobj", side_effect=StorageError("S3 PutObject network timeout")):
+                transport = ASGITransport(app=app)
+                async with AsyncClient(transport=transport, base_url="http://test") as client:
+                    files = {"file": ("report.pdf", io.BytesIO(b"Valid PDF Content"), "application/pdf")}
+                    response = await client.post("/api/v1/jobs", files=files)
+
+                assert response.status_code == 503
+                data = response.json()
+                assert data["error_code"] == "STORAGE_ERROR"
         finally:
             app.dependency_overrides.clear()

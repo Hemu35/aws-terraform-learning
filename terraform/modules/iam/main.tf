@@ -39,47 +39,44 @@ data "aws_iam_policy_document" "ecs_trust" {
   }
 }
 
-# ── ECS Task Role (application code permissions) ─────────────
-resource "aws_iam_role" "ecs_task_role" {
-  name               = "${var.project_name}-${var.environment}-ecs-task-role"
+# ── ECS API Task Role (API application permissions) ─────────
+resource "aws_iam_role" "api_task_role" {
+  name               = "${var.project_name}-${var.environment}-ecs-api-task-role"
   assume_role_policy = data.aws_iam_policy_document.ecs_trust.json
 
   tags = {
     Project     = var.project_name
     Environment = var.environment
     ManagedBy   = "terraform"
+    Service     = "api"
   }
 }
 
-data "aws_iam_policy_document" "ecs_task_permissions" {
-  # S3 — read input documents, write results
+data "aws_iam_policy_document" "api_task_permissions" {
+  # S3 — upload input documents and generate presigned URLs
   statement {
     sid    = "S3DocumentAccess"
     effect = "Allow"
     actions = [
-      "s3:GetObject",
       "s3:PutObject",
+      "s3:GetObject",
     ]
     resources = [
-      "${var.s3_bucket_arn}/*", # Scoped to objects inside this bucket only
+      "${var.s3_bucket_arn}/*",
     ]
   }
 
-  # SQS — produce and consume job messages
+  # SQS — produce/enqueue job messages only
   statement {
-    sid    = "SQSJobQueueAccess"
+    sid    = "SQSJobQueueProduceAccess"
     effect = "Allow"
     actions = [
       "sqs:SendMessage",
-      "sqs:ReceiveMessage",
-      "sqs:DeleteMessage",
-      "sqs:ChangeMessageVisibility", # Required by heartbeat to extend visibility & prevent redelivery loops
-      "sqs:GetQueueAttributes",      # Required by boto3 SDK for queue introspection
     ]
     resources = [var.sqs_queue_arn]
   }
 
-  # DynamoDB — read and write job state records
+  # DynamoDB — create job records, poll status, and update input keys
   statement {
     sid    = "DynamoDBJobTableAccess"
     effect = "Allow"
@@ -92,15 +89,78 @@ data "aws_iam_policy_document" "ecs_task_permissions" {
   }
 }
 
-resource "aws_iam_policy" "ecs_task_policy" {
-  name        = "${var.project_name}-${var.environment}-ecs-task-policy"
-  description = "Least-privilege policy for the ${var.project_name} ECS task (${var.environment})"
-  policy      = data.aws_iam_policy_document.ecs_task_permissions.json
+resource "aws_iam_policy" "api_task_policy" {
+  name        = "${var.project_name}-${var.environment}-ecs-api-task-policy"
+  description = "Least-privilege policy for the ${var.project_name} API task (${var.environment})"
+  policy      = data.aws_iam_policy_document.api_task_permissions.json
 }
 
-resource "aws_iam_role_policy_attachment" "ecs_task_policy" {
-  role       = aws_iam_role.ecs_task_role.name
-  policy_arn = aws_iam_policy.ecs_task_policy.arn
+resource "aws_iam_role_policy_attachment" "api_task_policy" {
+  role       = aws_iam_role.api_task_role.name
+  policy_arn = aws_iam_policy.api_task_policy.arn
+}
+
+# ── ECS Worker Task Role (Worker application permissions) ────
+resource "aws_iam_role" "worker_task_role" {
+  name               = "${var.project_name}-${var.environment}-ecs-worker-task-role"
+  assume_role_policy = data.aws_iam_policy_document.ecs_trust.json
+
+  tags = {
+    Project     = var.project_name
+    Environment = var.environment
+    ManagedBy   = "terraform"
+    Service     = "worker"
+  }
+}
+
+data "aws_iam_policy_document" "worker_task_permissions" {
+  # S3 — read input documents and write processing results
+  statement {
+    sid    = "S3DocumentProcessAccess"
+    effect = "Allow"
+    actions = [
+      "s3:GetObject",
+      "s3:PutObject",
+    ]
+    resources = [
+      "${var.s3_bucket_arn}/*",
+    ]
+  }
+
+  # SQS — consume, delete, and extend visibility for job messages
+  statement {
+    sid    = "SQSJobQueueConsumeAccess"
+    effect = "Allow"
+    actions = [
+      "sqs:ReceiveMessage",
+      "sqs:DeleteMessage",
+      "sqs:ChangeMessageVisibility",
+      "sqs:GetQueueAttributes",
+    ]
+    resources = [var.sqs_queue_arn]
+  }
+
+  # DynamoDB — query job items and atomically update lease/status transitions
+  statement {
+    sid    = "DynamoDBJobTableLeaseAccess"
+    effect = "Allow"
+    actions = [
+      "dynamodb:GetItem",
+      "dynamodb:UpdateItem",
+    ]
+    resources = [var.dynamodb_table_arn]
+  }
+}
+
+resource "aws_iam_policy" "worker_task_policy" {
+  name        = "${var.project_name}-${var.environment}-ecs-worker-task-policy"
+  description = "Least-privilege policy for the ${var.project_name} Worker task (${var.environment})"
+  policy      = data.aws_iam_policy_document.worker_task_permissions.json
+}
+
+resource "aws_iam_role_policy_attachment" "worker_task_policy" {
+  role       = aws_iam_role.worker_task_role.name
+  policy_arn = aws_iam_policy.worker_task_policy.arn
 }
 
 # ── ECS Execution Role (ECS control-plane permissions) ───────

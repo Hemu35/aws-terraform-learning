@@ -22,6 +22,7 @@ from fastapi.responses import JSONResponse
 from app.core.config import get_settings
 from app.core.exceptions import (
     AppError,
+    DataIntegrityError,
     InvalidFileTypeError,
     JobAlreadyExistsError,
     JobNotFoundError,
@@ -96,6 +97,15 @@ async def invalid_file_type_handler(request: Request, exc: InvalidFileTypeError)
     return JSONResponse(
         status_code=415,
         content={"detail": exc.message, "error_code": "UNSUPPORTED_MEDIA_TYPE"},
+    )
+
+
+@app.exception_handler(DataIntegrityError)
+async def data_integrity_error_handler(request: Request, exc: DataIntegrityError) -> JSONResponse:
+    logger.error("Data integrity error", extra={"error_message": exc.message, "details": exc.details})
+    return JSONResponse(
+        status_code=500,
+        content={"detail": exc.message, "error_code": "DATA_INTEGRITY_ERROR"},
     )
 
 

@@ -203,3 +203,32 @@ def test_generate_presigned_url_returns_string():
     url = service.generate_presigned_url("job-pu/input/doc.txt")
     assert isinstance(url, str)
     assert len(url) > 0
+
+
+@mock_aws
+def test_upload_fileobj_success():
+    """Streaming upload via upload_fileobj stores bytes in mocked S3 bucket."""
+    import io
+
+    settings = _make_settings()
+    _create_bucket(settings)
+    service = S3Service(settings)
+
+    stream = io.BytesIO(b"Streamed binary content")
+    s3_key = service.upload_fileobj(
+        job_id="job-stream",
+        filename="stream.pdf",
+        fileobj=stream,
+        content_type="application/pdf",
+        size_bytes=len(stream.getvalue()),
+    )
+    assert s3_key == "job-stream/input/stream.pdf"
+
+    client = boto3.client(
+        "s3",
+        region_name=settings.aws_default_region,
+        aws_access_key_id=settings.aws_access_key_id,
+        aws_secret_access_key=settings.aws_secret_access_key,
+    )
+    response = client.get_object(Bucket=settings.s3_bucket_name, Key=s3_key)
+    assert response["Body"].read() == b"Streamed binary content"

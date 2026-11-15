@@ -24,8 +24,45 @@ variable "worker_image" {
 }
 
 variable "task_role_arn" {
-  description = "ARN of the IAM role the task code assumes (business permissions)"
+  description = "Fallback ARN of the IAM role for tasks (backward-compatible alias)"
   type        = string
+  default     = ""
+}
+
+variable "api_task_role_arn" {
+  description = "ARN of the IAM role the API task code assumes"
+  type        = string
+  default     = ""
+}
+
+variable "worker_task_role_arn" {
+  description = "ARN of the IAM role the Worker task code assumes"
+  type        = string
+  default     = ""
+}
+
+variable "api_desired_count" {
+  description = "Desired number of API tasks"
+  type        = number
+  default     = 1
+}
+
+variable "worker_desired_count" {
+  description = "Desired number of Worker tasks"
+  type        = number
+  default     = 1
+}
+
+variable "public_subnet_ids" {
+  description = "List of public subnet IDs for the ALB"
+  type        = list(string)
+  default     = []
+}
+
+variable "sqs_queue_name" {
+  description = "Name of the SQS queue for worker autoscaling metrics"
+  type        = string
+  default     = ""
 }
 
 variable "execution_role_arn" {

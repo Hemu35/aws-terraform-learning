@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -42,8 +43,12 @@ class VisibilityHeartbeat:
 
     Runs in a background thread to prevent duplicate delivery and lease expiration
     when document processing takes longer than default timeouts.
-    If lease renewal is rejected (fenced out by a newer worker generation),
-    the thread signals `is_fenced_out` so the processor can abort safely.
+
+    Fail-safe design:
+    - Authoritative conditional ownership failure: Immediately fences out worker.
+    - Transient network/service errors: Implements bounded retries (max_consecutive_failures)
+      and a safety window. If lease cannot be renewed within the safety window, the worker
+      is fenced out to prevent split-brain processing.
     """
 
     def __init__(
@@ -56,6 +61,7 @@ class VisibilityHeartbeat:
         job_id: Optional[str] = None,
         worker_id: Optional[str] = None,
         processing_version: Optional[int] = None,
+        max_consecutive_failures: int = 3,
     ) -> None:
         self._sqs = sqs
         self._receipt_handle = receipt_handle
@@ -65,6 +71,9 @@ class VisibilityHeartbeat:
         self._job_id = job_id
         self._worker_id = worker_id
         self._processing_version = processing_version
+        self._max_consecutive_failures = max_consecutive_failures
+        self._consecutive_failures = 0
+        self._last_successful_renewal = time.monotonic()
         self._stop_event = threading.Event()
         self._fenced_out_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -107,11 +116,44 @@ class VisibilityHeartbeat:
                         )
                         self._fenced_out_event.set()
                         return
+
+                    # Successful renewal resets transient failure counter
+                    self._consecutive_failures = 0
+                    self._last_successful_renewal = time.monotonic()
+
                 except Exception as exc:
+                    self._consecutive_failures += 1
                     logger.warning(
-                        "Heartbeat failed to renew DynamoDB lease",
-                        extra={"job_id": self._job_id, "error": str(exc)},
+                        "Heartbeat transient failure renewing DynamoDB lease",
+                        extra={
+                            "job_id": self._job_id,
+                            "error": str(exc),
+                            "consecutive_failures": self._consecutive_failures,
+                            "max_failures": self._max_consecutive_failures,
+                        },
                     )
+                    # Check bounded retry threshold
+                    if self._consecutive_failures >= self._max_consecutive_failures:
+                        logger.error(
+                            "Heartbeat exceeded maximum consecutive transient renewal failures — fencing out worker",
+                            extra={
+                                "job_id": self._job_id,
+                                "consecutive_failures": self._consecutive_failures,
+                            },
+                        )
+                        self._fenced_out_event.set()
+                        return
+
+                    # Check time-based safety window: if 90% of lease duration has elapsed without renewal
+                    elapsed = time.monotonic() - self._last_successful_renewal
+                    safety_window = self._extension * 0.9
+                    if elapsed >= safety_window:
+                        logger.error(
+                            "Lease safety window elapsed without confirmed renewal — fencing out worker",
+                            extra={"job_id": self._job_id, "elapsed_seconds": elapsed, "safety_window": safety_window},
+                        )
+                        self._fenced_out_event.set()
+                        return
 
             # 2. Extend SQS visibility timeout
             if self._receipt_handle:
@@ -324,6 +366,14 @@ class JobProcessor:
 
                 # 6. Generate presigned URL for the result
                 presigned_url = self._s3.generate_presigned_url(result_key)
+
+                # Check fencing before completing in DynamoDB
+                if heartbeat.is_fenced_out:
+                    logger.warning(
+                        "Worker was fenced out before completion — aborting final commit",
+                        extra={"job_id": job_id, "worker_id": self.worker_id, "version": version},
+                    )
+                    return False
 
                 # 7. Complete job in DynamoDB guarded by lease ownership and fencing token
                 completed = self._dynamo.complete_job_with_lease(

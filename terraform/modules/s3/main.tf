@@ -84,5 +84,10 @@ resource "aws_s3_bucket_lifecycle_configuration" "documents" {
     noncurrent_version_expiration {
       noncurrent_days = 30
     }
+
+    # Automatically abort and clean up abandoned multipart uploads after 7 days
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
   }
 }

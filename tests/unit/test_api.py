@@ -107,6 +107,7 @@ async def test_get_job_status_completed(
         created_at=now,
         updated_at=now,
         s3_input_key="completed-job-456/input/test.txt",
+        s3_output_key="completed-job-456/output/result.json",
         result_url="https://s3.amazonaws.com/placeholder-presigned-url",
     )
     db_service = DynamoDBService(override_settings)

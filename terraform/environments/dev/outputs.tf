@@ -62,7 +62,22 @@ output "ecs_service_name" {
   value       = module.ecs.service_name
 }
 
+output "ecs_api_service_name" {
+  description = "ECS API service name"
+  value       = module.ecs.api_service_name
+}
+
+output "ecs_worker_service_name" {
+  description = "ECS Worker service name"
+  value       = module.ecs.worker_service_name
+}
+
+output "alb_dns_name" {
+  description = "Application Load Balancer DNS name"
+  value       = module.ecs.alb_dns_name
+}
+
 output "ecs_task_definition_arn" {
-  description = "ECS task definition ARN"
+  description = "ECS API task definition ARN"
   value       = module.ecs.task_definition_arn
 }
